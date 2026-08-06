@@ -113,6 +113,7 @@ class RestSecurityOracle {
         handleAnonymousWriteCheck(individual, actionResults, fv)
         handleHiddenAccessible(individual, actionResults, fv)
         handleSsrfFaults(individual, actionResults, fv)
+        handleStatefulAuthorization(individual, actionResults, fv)
     }
 
     private fun handleSsrfFaults(
@@ -545,6 +546,69 @@ class RestSecurityOracle {
             )
             fv.updateTarget(scenarioId, 1.0, actionIndex)
             result.addFault(DetectedFault(faultCategory, action.getName(), null))
+        }
+    }
+
+    private fun handleStatefulAuthorization(
+        individual: RestIndividual,
+        actionResults: List<ActionResult>,
+        fv: FitnessValue
+    ) {
+
+        if (!config.isEnabledFaultCategory(ExperimentalFaultCategory.SECURITY_STATEFUL_AUTHORIZATION)) {
+            return
+        }
+
+        val actions = individual.seeMainExecutableActions()
+
+        fun statusOf(a: RestCallAction): Int? =
+            (actionResults.find { it.sourceLocalId == a.getLocalId() } as RestCallResult?)?.getStatusCode()
+
+        fun isAllowed(a: RestCallAction): Boolean {
+            val code = statusOf(a) ?: return false
+            return StatusGroup.G_2xx.isInGroup(code)
+        }
+
+        for (srcIndex in actions.indices) {
+            val source = actions[srcIndex]
+            if (source.auth is NoAuth || !isAllowed(source)) {
+                continue
+            }
+
+            for (followUpIndex in (srcIndex + 1) until actions.size) {
+                val followUp = actions[followUpIndex]
+
+                if (followUp.getName() != source.getName() || followUp.auth.isDifferentFrom(source.auth)) {
+                    continue
+                }
+                if (!isAllowed(followUp)) {
+                    continue
+                }
+
+                val hasTransition = (srcIndex + 1 until followUpIndex).any {
+                    val t = actions[it]
+                    t.auth.isDifferentFrom(source.auth) && isAllowed(t)
+                }
+                if (!hasTransition) {
+                    continue
+                }
+
+                val result = actionResults
+                    .filterIsInstance<RestCallResult>()
+                    .find { it.sourceLocalId == followUp.getLocalId() }
+                    ?: continue
+
+                val scenarioId = idMapper.handleLocalTarget(
+                    idMapper.getFaultDescriptiveId(
+                        ExperimentalFaultCategory.SECURITY_STATEFUL_AUTHORIZATION, followUp.getName()
+                    )
+                )
+                fv.updateTarget(scenarioId, 1.0, followUpIndex)
+                result.addFault(
+                    DetectedFault(ExperimentalFaultCategory.SECURITY_STATEFUL_AUTHORIZATION, followUp.getName(), null)
+                )
+                return
+            }
         }
     }
 

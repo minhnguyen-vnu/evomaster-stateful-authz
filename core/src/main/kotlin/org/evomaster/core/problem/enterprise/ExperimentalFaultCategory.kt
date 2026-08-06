@@ -51,6 +51,11 @@ enum class ExperimentalFaultCategory(
     HTTP_STATUS_NO_205_IF_CONTENT(964,"HTTP/REST-Design Violation: no-205-if-content","205WhenContent", "TODO"),
     HTTP_STATUS_NO_426_IF_NO_UPGRADE(965,"HTTP/REST-Design Violation: no-426-if-no-upgrade","426MissingUpgrade", "TODO"),
 
+    SECURITY_STATEFUL_AUTHORIZATION(970,
+        "Stateful Authorization: privilege persists after a permission-reducing transition",
+        "stillAllowedAfterPermissionRevoked",
+        "An action requiring a privilege, once observed ALLOWED, was still ALLOWED when replayed with the same credential after that privilege was removed (e.g. a role downgrade). The removal was never enforced on the already-issued credential."),
+
     //3xx: GraphQL
     GQL_ERROR_FIELD(920, "Error Field", "returnedErrors",
         "TODO"),
