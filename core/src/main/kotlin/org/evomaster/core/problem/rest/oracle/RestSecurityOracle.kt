@@ -571,7 +571,10 @@ class RestSecurityOracle {
 
         for (srcIndex in actions.indices) {
             val source = actions[srcIndex]
-            if (source.auth is NoAuth || !isAllowed(source)) {
+            if (source.auth is NoAuth
+                || !isAllowed(source)
+                || source.verb !in listOf(HttpVerb.PUT, HttpVerb.PATCH, HttpVerb.POST, HttpVerb.DELETE)
+                || RestSecurityBuilder.looksLikePermissionReducingTransition(source)) {
                 continue
             }
 
@@ -587,7 +590,9 @@ class RestSecurityOracle {
 
                 val hasTransition = (srcIndex + 1 until followUpIndex).any {
                     val t = actions[it]
-                    t.auth.isDifferentFrom(source.auth) && isAllowed(t)
+                    t.auth.isDifferentFrom(source.auth)
+                        && isAllowed(t)
+                        && RestSecurityBuilder.looksLikePermissionReducingTransition(t)
                 }
                 if (!hasTransition) {
                     continue

@@ -57,6 +57,20 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
     companion object {
         private val log: Logger = LoggerFactory.getLogger(RestSecurityBuilder::class.java)
+
+        private val TRANSITION_PATH_SIGNALS =
+            listOf("role","permission","member","subscription","plan","owner","grant","access")
+
+        private val TRANSITION_VERBS =
+            listOf(HttpVerb.PUT, HttpVerb.PATCH, HttpVerb.POST, HttpVerb.DELETE)
+
+        fun looksLikePermissionReducingTransition(a: RestCallAction): Boolean {
+            if (a.verb !in TRANSITION_VERBS) {
+                return false
+            }
+            val hay = (a.path.toString() + " " + a.getName()).lowercase()
+            return TRANSITION_PATH_SIGNALS.any { hay.contains(it) }
+        }
     }
 
     /**
@@ -304,7 +318,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         TODO("Not yet implemented")
     }
 
-    private val transitionPathSignals = listOf("role","permission","member","subscription","plan","owner","grant","access")
+    private val transitionPathSignals = TRANSITION_PATH_SIGNALS
     private val transitionUserParamSignals = listOf("username","userid","user_id","user","account","member","subject","principal","id")
     private val roleFieldSignals = listOf("role","plan","permission","level","tier")
     private val roleLowPrivSignals = listOf("view","read","guest","basic","free","member","user","none","restrict","limited")
