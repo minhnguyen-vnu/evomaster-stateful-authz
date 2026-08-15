@@ -64,6 +64,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
         private val TRANSITION_VERBS =
             listOf(HttpVerb.PUT, HttpVerb.PATCH, HttpVerb.POST, HttpVerb.DELETE)
 
+        private const val MAX_STATEFUL_TRIPLE_ATTEMPTS = 8
+
         fun looksLikePermissionReducingTransition(a: RestCallAction): Boolean {
             if (a.verb !in TRANSITION_VERBS) {
                 return false
@@ -324,6 +326,10 @@ class RestSecurityBuilder : TimeBoxedPhase {
     private val roleLowPrivSignals = listOf("view","read","guest","basic","free","member","user","none","restrict","limited")
     private val roleHighPrivSignals = listOf("admin","owner","super","root","manage","write","edit","power","full")
 
+    private val privilegeReducedInPhase = mutableSetOf<String>()
+
+    private var statefulTripleAttempts = 0
+
     private fun addForStatefulAccessControl() {
 
         if (!config.isEnabledFaultCategory(ExperimentalFaultCategory.SECURITY_STATEFUL_AUTHORIZATION)) {
@@ -360,13 +366,17 @@ class RestSecurityBuilder : TimeBoxedPhase {
                 ).isNotEmpty()
                 if (!guarded) continue
 
-                val victimSlice = RestIndividualSelectorUtils.findAndSlice(
+                val victimCandidates = RestIndividualSelectorUtils.findAndSlice(
                     individualsInSolution, verb, op.path,
                     statusGroup = StatusGroup.G_2xx, authenticated = true
-                ).minByOrNull { it.size() }
-                if (victimSlice == null) continue
+                ).sortedBy { it.size() }
+                    .distinctBy { it.seeMainExecutableActions().last().auth.name }
 
-                buildStatefulAuthzTriple(victimSlice, transition, reducedRole)
+                for (victimSlice in victimCandidates) {
+                    if (hasPhaseTimedOut()) return
+                    if (statefulTripleAttempts >= MAX_STATEFUL_TRIPLE_ATTEMPTS) return
+                    if (buildStatefulAuthzTriple(victimSlice, transition, reducedRole)) break
+                }
             }
         }
     }
@@ -375,20 +385,40 @@ class RestSecurityBuilder : TimeBoxedPhase {
         victimSlice: RestIndividual,
         transitionDef: RestCallAction,
         reducedRole: String
-    ) {
-        val base = victimSlice.copy() as RestIndividual
-        val source = base.seeMainExecutableActions().lastOrNull() ?: return
-        val victimAuth = source.auth
-        if (victimAuth is NoAuth) return
+    ): Boolean {
+        val victimAuth = victimSlice.seeMainExecutableActions().lastOrNull()?.auth ?: return false
+        if (victimAuth is NoAuth) return false
+        if (privilegeReducedInPhase.contains(victimAuth.name)) return false
 
-        val others = authSettings.getAllOthers(victimAuth.name, HttpWsAuthenticationInfo::class.java)
-        if (others.isEmpty()) return
-        val operator = others.firstOrNull { o ->
-            RestIndividualSelectorUtils.findIndividuals(
-                individualsInSolution, transitionDef.verb, transitionDef.path,
-                statusGroup = StatusGroup.G_2xx, authenticatedWith = o.name
-            ).isNotEmpty()
-        } ?: others.first()
+        val operators = authSettings.getAllOthers(victimAuth.name, HttpWsAuthenticationInfo::class.java)
+            .filter { !privilegeReducedInPhase.contains(it.name) }
+            .sortedByDescending { o ->
+                RestIndividualSelectorUtils.findIndividuals(
+                    individualsInSolution, transitionDef.verb, transitionDef.path,
+                    statusGroup = StatusGroup.G_2xx, authenticatedWith = o.name
+                ).isNotEmpty()
+            }
+
+        for (operator in operators) {
+            if (hasPhaseTimedOut()) return false
+            if (statefulTripleAttempts >= MAX_STATEFUL_TRIPLE_ATTEMPTS) return false
+            if (executeStatefulAuthzTriple(victimSlice, transitionDef, reducedRole, operator)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun executeStatefulAuthzTriple(
+        victimSlice: RestIndividual,
+        transitionDef: RestCallAction,
+        reducedRole: String,
+        operator: HttpWsAuthenticationInfo
+    ): Boolean {
+        val base = victimSlice.copy() as RestIndividual
+        val source = base.seeMainExecutableActions().lastOrNull() ?: return false
+        val victimAuth = source.auth
+        if (victimAuth is NoAuth) return false
 
         val transition = transitionDef.copy() as RestCallAction
         transition.resetLocalIdRecursively()
@@ -397,11 +427,11 @@ class RestSecurityBuilder : TimeBoxedPhase {
         transition.auth = operator
         if (!setUserTargetToVictim(transition, victimAuth.name)) {
             log.debug("Stateful-authorization: could not target victim '${victimAuth.name}' on ${transition.getName()}")
-            return
+            return false
         }
         if (!setRoleFieldToReduced(transition, reducedRole)) {
             log.debug("Stateful-authorization: could not set reduced role '$reducedRole' on ${transition.getName()}")
-            return
+            return false
         }
         base.addMainActionInEmptyEnterpriseGroup(action = transition)
 
@@ -422,8 +452,39 @@ class RestSecurityBuilder : TimeBoxedPhase {
         val ei = fitness.computeWholeAchievedCoverageForPostProcessing(base)
         if (ei == null) {
             log.warn("Failed to evaluate constructed stateful-authorization individual")
-            return
+            return false
         }
+        statefulTripleAttempts++
+
+        fun statusOf(a: RestCallAction): Int? =
+            (ei.seeResult(a.getLocalId()) as? RestCallResult)?.getStatusCode()
+        val sourceCode = statusOf(source)
+        val transitionCode = statusOf(transition)
+        val followUpCode = statusOf(followUp)
+        val observed = listOf(sourceCode, transitionCode, followUpCode)
+            .joinToString("/") { it?.toString() ?: "-" }
+
+        if (transitionCode != null && StatusGroup.G_2xx.isInGroup(transitionCode)) {
+            privilegeReducedInPhase.add(victimAuth.name)
+        }
+
+        val valid = sourceCode != null && StatusGroup.G_2xx.isInGroup(sourceCode)
+            && transitionCode != null && StatusGroup.G_2xx.isInGroup(transitionCode)
+            && followUpCode != null && followUpCode != 401
+
+        if (!valid) {
+            LoggingUtil.getInfoLogger().info(
+                "Discarded a VOID stateful-authorization (MR-A1) attempt on ${source.getName()}" +
+                    " (victim '${victimAuth.name}', operator '${operator.name}', codes $observed)"
+            )
+            return false
+        }
+
+        LoggingUtil.getInfoLogger().info(
+            "Assembled a stateful-authorization (MR-A1) triple on ${source.getName()}" +
+                " (victim '${victimAuth.name}', operator '${operator.name}'," +
+                " transition ${transition.getName()}, statuses $observed)"
+        )
         if (ExperimentalFaultCategory.SECURITY_STATEFUL_AUTHORIZATION in DetectedFaultUtils.getDetectedFaultCategories(ei)) {
             LoggingUtil.getInfoLogger().info(
                 "Constructed a stateful-authorization (MR-A1) test revealing privilege persistence" +
@@ -431,6 +492,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
             )
         }
         archive.addIfNeeded(ei)
+        return true
     }
 
     private fun findPermissionReducingTransition(): RestCallAction? {
