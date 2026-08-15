@@ -28,6 +28,10 @@ import org.evomaster.core.problem.rest.param.QueryParam
 import org.evomaster.core.problem.rest.resource.RestResourceCalls
 import org.evomaster.core.problem.rest.service.sampler.AbstractRestSampler
 import org.evomaster.core.problem.security.service.SSRFAnalyser
+import org.evomaster.core.remote.HttpClientFactory
+import javax.ws.rs.client.Client
+import javax.ws.rs.client.Entity
+import javax.ws.rs.core.MediaType
 import org.evomaster.core.search.gene.string.StringGene
 
 import org.evomaster.core.search.*
@@ -330,6 +334,47 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
     private var statefulTripleAttempts = 0
 
+    private val resetClient: Client by lazy { HttpClientFactory.createTrustingJerseyClient() }
+
+    private fun resetSutState() {
+
+        val spec = config.statefulAuthzResetEndpoint
+        if (spec.isBlank()) return
+
+        val parts = spec.trim().split(Regex("\\s+"), 2)
+        if (parts.size != 2) {
+            LoggingUtil.uniqueUserWarn("Ignoring malformed statefulAuthzResetEndpoint '$spec':" +
+                    " expected \"<VERB> <URL>\", eg \"POST http://localhost:8080/reset\"")
+            return
+        }
+        val (verb, url) = parts
+
+        val status = try {
+            val b = resetClient.target(url).request()
+            val empty = Entity.entity("", MediaType.APPLICATION_JSON_TYPE)
+            val r = when (verb.uppercase()) {
+                "GET" -> b.get()
+                "POST" -> b.post(empty)
+                "PUT" -> b.put(empty)
+                "DELETE" -> b.delete()
+                else -> {
+                    LoggingUtil.uniqueUserWarn("Ignoring statefulAuthzResetEndpoint: unsupported verb '$verb'")
+                    return
+                }
+            }
+            r.status.also { r.close() }
+        } catch (e: Exception) {
+            LoggingUtil.getInfoLogger().warn("SUT state reset via $spec failed: ${e.message}")
+            return
+        }
+
+        LoggingUtil.getInfoLogger().info("SUT state reset via $spec -> $status")
+
+        if (status in 200..299) {
+            privilegeReducedInPhase.clear()
+        }
+    }
+
     private fun addForStatefulAccessControl() {
 
         if (!config.isEnabledFaultCategory(ExperimentalFaultCategory.SECURITY_STATEFUL_AUTHORIZATION)) {
@@ -448,6 +493,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
         base.ensureFlattenedStructure()
         base.fixResourceForwardLinks()
         org.evomaster.core.Lazy.assert { base.verifyValidity(); true }
+
+        resetSutState()
 
         val ei = fitness.computeWholeAchievedCoverageForPostProcessing(base)
         if (ei == null) {

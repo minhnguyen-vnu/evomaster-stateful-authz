@@ -3041,6 +3041,15 @@ class EMConfig {
             "When false, all experimental oracles are disabled.")
     var useExperimentalOracles = false
 
+    @Experimental
+    @Cfg("THESIS EXTENSION. Endpoint used to restore the SUT to a known state before each attempt at" +
+            " building a stateful-authorization (MR-A1) triple, given as \"<VERB> <URL>\", eg" +
+            " \"POST http://localhost:8080/reset\". This is the black-box analogue of the state reset" +
+            " that white-box EvoMaster performs through the SUT driver. When empty (the default), no" +
+            " reset is done, and the search phase may already have demoted or deleted the accounts the" +
+            " triple needs.")
+    var statefulAuthzResetEndpoint = ""
+
     enum class VulnerableInputClassificationStrategy {
         /**
          * Uses the manual methods to select the vulnerable inputs.
