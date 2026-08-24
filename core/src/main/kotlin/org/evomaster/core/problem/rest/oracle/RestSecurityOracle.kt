@@ -574,7 +574,7 @@ class RestSecurityOracle {
             if (source.auth is NoAuth
                 || !isAllowed(source)
                 || source.verb !in listOf(HttpVerb.PUT, HttpVerb.PATCH, HttpVerb.POST, HttpVerb.DELETE)
-                || RestSecurityBuilder.looksLikePermissionReducingTransition(source)) {
+                || RestSecurityBuilder.looksLikePermissionReducingTransition(source, config.statefulAuthzTransition)) {
                 continue
             }
 
@@ -592,7 +592,7 @@ class RestSecurityOracle {
                     val t = actions[it]
                     t.auth.isDifferentFrom(source.auth)
                         && isAllowed(t)
-                        && RestSecurityBuilder.looksLikePermissionReducingTransition(t)
+                        && RestSecurityBuilder.looksLikePermissionReducingTransition(t, config.statefulAuthzTransition)
                 }
                 if (!hasTransition) {
                     continue

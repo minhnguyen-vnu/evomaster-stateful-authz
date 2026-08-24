@@ -3050,6 +3050,20 @@ class EMConfig {
             " triple needs.")
     var statefulAuthzResetEndpoint = ""
 
+    @Experimental
+    @Cfg("THESIS EXTENSION. Declare the permission-reducing transition explicitly, for APIs whose" +
+            " transition cannot be inferred from the schema: either because its name is outside the" +
+            " built-in vocabulary, or because the schema exposes no role enum to harvest a reduced" +
+            " value from. Format: \"<VERB> <PATH> name=value ...\", where a value may be the" +
+            " placeholder <victim> or <operator>, eg" +
+            " \"POST /api/set_user_permission user=<victim> role=1 permission=0\"." +
+            " When empty (the default), the transition is inferred from the schema exactly as before," +
+            " so this option cannot alter results measured without it. Note this declares only WHICH" +
+            " action reduces a permission and HOW to aim it at a victim: choosing the victim, finding" +
+            " the guarded action, replaying the pre-transition credential and judging the outcome all" +
+            " still run unchanged, so a run using this option does NOT measure black-box recall.")
+    var statefulAuthzTransition = ""
+
     enum class VulnerableInputClassificationStrategy {
         /**
          * Uses the manual methods to select the vulnerable inputs.
