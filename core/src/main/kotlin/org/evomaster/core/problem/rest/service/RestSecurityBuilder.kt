@@ -74,6 +74,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
         private const val MAX_STATEFUL_TRIPLE_ATTEMPTS_DECLARED = 40
 
+        private const val MAX_PRIVILEGE_RESTORES = 3
+
         fun looksLikePermissionReducingTransition(a: RestCallAction, declared: String = ""): Boolean {
             parseDeclaredTransition(declared)?.let {
                 return a.verb == it.verb && a.path.toString().equals(it.path, ignoreCase = true)
@@ -367,11 +369,20 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
     private val stringRoleCandidates = listOf("user", "viewer", "guest", "member", "basic")
 
+    private val elevatedNumericRoleCandidates = listOf("0", "1", "2")
+
+    private val elevatedStringRoleCandidates = listOf("admin", "administrator", "owner", "superuser")
+
     private val privilegeReducedInPhase = mutableSetOf<String>()
 
     private var statefulTripleAttempts = 0
 
     private var maxStatefulAttempts = MAX_STATEFUL_TRIPLE_ATTEMPTS
+
+    private var privilegeRestoreAttempts = 0
+
+    private var lastSourceCode: Int? = null
+    private var lastTransitionCode: Int? = null
 
     private val resetClient: Client by lazy { HttpClientFactory.createTrustingJerseyClient() }
 
@@ -541,6 +552,36 @@ class RestSecurityBuilder : TimeBoxedPhase {
                 break
             }
         }
+
+        val src = lastSourceCode
+        val operatorsRefused = lastTransitionCode == 401 || lastTransitionCode == 403
+        if (declared == null && operatorsRefused && src != null && StatusGroup.G_2xx.isInGroup(src)) {
+
+            val elevatedCandidates =
+                harvestElevatedRoleCandidates(transitionDef, reducedRoleCandidates.firstOrNull() ?: "")
+
+            for (operator in operators) {
+                for (elevated in elevatedCandidates) {
+                    if (hasPhaseTimedOut()) return false
+                    if (statefulTripleAttempts >= maxStatefulAttempts) return false
+                    if (privilegeRestoreAttempts >= MAX_PRIVILEGE_RESTORES) return false
+
+                    if (!restorePrivilege(transitionDef, operator.name, victimAuth, elevated, victimSlice)) {
+                        continue
+                    }
+
+                    for (reducedRole in reducedRoleCandidates) {
+                        val before = statefulTripleAttempts
+                        if (executeStatefulAuthzTriple(victimSlice, transitionDef, reducedRole, operator, declared)) {
+                            return true
+                        }
+                        if (statefulTripleAttempts == before) continue
+                        if (privilegeReducedInPhase.contains(victimAuth.name)) return false
+                        break
+                    }
+                }
+            }
+        }
         return false
     }
 
@@ -607,6 +648,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
         val sourceCode = statusOf(source)
         val transitionCode = statusOf(transition)
         val followUpCode = statusOf(followUp)
+        lastSourceCode = sourceCode
+        lastTransitionCode = transitionCode
         val observed = listOf(sourceCode, transitionCode, followUpCode)
             .joinToString("/") { it?.toString() ?: "-" }
 
@@ -703,6 +746,68 @@ class RestSecurityBuilder : TimeBoxedPhase {
         return (lowPrivEnum + numeric + (enumVocab - lowPrivEnum.toSet()) + strings).distinct()
     }
 
+    private fun harvestElevatedRoleCandidates(transition: RestCallAction, exclude: String): List<String> {
+
+        val enumVocab = (allGenes(transition) + actionDefinitions.flatMap { allGenes(it) })
+            .filterIsInstance<EnumGene<*>>()
+            .flatMap { it.values.map { v -> v.toString() } }
+            .distinct()
+
+        val highPrivEnum = enumVocab.filter { v ->
+            val lv = v.lowercase()
+            roleHighPrivSignals.any { lv.contains(it) }
+        }
+
+        val roleGenes = allGenes(transition).filter { g ->
+            val n = g.name.lowercase()
+            roleFieldSignals.any { n == it || n.contains(it) }
+        }
+        val numeric = if (roleGenes.any { it is IntegerGene || it is LongGene }) elevatedNumericRoleCandidates else emptyList()
+        val strings = if (roleGenes.any { it is StringGene }) elevatedStringRoleCandidates else emptyList()
+
+        return (highPrivEnum + numeric + strings).distinct().filter { it != exclude }
+    }
+
+    private fun restorePrivilege(
+        transitionDef: RestCallAction,
+        target: String,
+        restorer: HttpWsAuthenticationInfo,
+        elevatedRole: String,
+        victimSlice: RestIndividual
+    ): Boolean {
+
+        if (privilegeRestoreAttempts >= MAX_PRIVILEGE_RESTORES) return false
+
+        val action = transitionDef.copy() as RestCallAction
+        action.resetLocalIdRecursively()
+        action.forceNewTaints()
+        action.doInitialize(randomness)
+        action.auth = restorer
+        if (!setUserTargetToVictim(action, target)) return false
+        if (!setAllRoleFieldsTo(action, elevatedRole)) return false
+
+        val base = victimSlice.copy() as RestIndividual
+        base.addMainActionInEmptyEnterpriseGroup(action = action)
+        base.doInitializeLocalId()
+        base.modifySampleType(SampleType.SECURITY)
+        base.ensureFlattenedStructure()
+        base.fixResourceForwardLinks()
+
+        val ei = fitness.computeWholeAchievedCoverageForPostProcessing(base) ?: return false
+        privilegeRestoreAttempts++
+
+        val code = (ei.seeResult(action.getLocalId()) as? RestCallResult)?.getStatusCode()
+        val accepted = code != null && StatusGroup.G_2xx.isInGroup(code)
+        LoggingUtil.getInfoLogger().info(
+            "Privilege-restore ${if (accepted) "accepted" else "refused"} for \'$target\'" +
+                " by \'${restorer.name}\' with role \'$elevatedRole\' on ${action.getName()} -> ${code ?: "-"}"
+        )
+        if (accepted) {
+            privilegeReducedInPhase.remove(target)
+        }
+        return accepted
+    }
+
     private fun allGenes(action: RestCallAction): List<Gene> =
         action.seeTopGenes().flatMap { it.flatView() }
 
@@ -714,6 +819,25 @@ class RestSecurityBuilder : TimeBoxedPhase {
     private fun setRoleFieldToReduced(action: RestCallAction, reducedRole: String): Boolean =
         setInParams(action.parameters.filterIsInstance<BodyParam>(), roleFieldSignals, reducedRole)
             || setInQueryParamsTopLevel(action, roleFieldSignals, reducedRole)
+
+    private fun setAllRoleFieldsTo(action: RestCallAction, value: String): Boolean {
+        var any = false
+        for (p in action.parameters.filterIsInstance<BodyParam>()) {
+            for (g in p.primaryGene().flatView()) {
+                val n = g.name.lowercase()
+                if (roleFieldSignals.any { n == it || n.contains(it) } && g.setFromStringValue(value)) {
+                    any = true
+                }
+            }
+        }
+        for (p in action.parameters.filterIsInstance<QueryParam>()) {
+            val n = p.name.lowercase()
+            if (roleFieldSignals.any { n == it || n.contains(it) } && p.primaryGene().setFromStringValue(value)) {
+                any = true
+            }
+        }
+        return any
+    }
 
     private fun setInQueryParamsTopLevel(
         action: RestCallAction,
