@@ -465,6 +465,10 @@ class RestSecurityBuilder : TimeBoxedPhase {
             }
         }
 
+        // local copy with non-null type: avoids capturing a deferred-initialized val
+        // (and relying on a smart cast) inside the local function below
+        val transitionOp: RestCallAction = transition
+
         maxStatefulAttempts = if (declared != null) {
             MAX_STATEFUL_TRIPLE_ATTEMPTS_DECLARED
         } else {
@@ -474,7 +478,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         fun guardedCandidatesFor(verbs: List<HttpVerb>) = verbs.flatMap { verb ->
             RestIndividualSelectorUtils.getAllActionDefinitions(actionDefinitions, verb)
                 .filter { op ->
-                    op.path != transition.path
+                    op.path != transitionOp.path
                         && RestIndividualSelectorUtils.findIndividuals(
                             individualsInSolution, verb, op.path, status = 403
                         ).isNotEmpty()
@@ -506,7 +510,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
                 for (victimSlice in victimCandidates) {
                     if (hasPhaseTimedOut()) return
                     if (statefulTripleAttempts >= maxStatefulAttempts) return
-                    if (buildStatefulAuthzTriple(victimSlice, transition, reducedRoleCandidates, declared)) break
+                    if (buildStatefulAuthzTriple(victimSlice, transitionOp, reducedRoleCandidates, declared)) break
                 }
             }
         }
