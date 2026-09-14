@@ -384,6 +384,9 @@ class RestSecurityBuilder : TimeBoxedPhase {
     private var lastSourceCode: Int? = null
     private var lastTransitionCode: Int? = null
 
+    var statefulTripleUnderEvaluation = false
+        private set
+
     private val resetClient: Client by lazy { HttpClientFactory.createTrustingJerseyClient() }
 
     private fun resetSutState() {
@@ -640,7 +643,12 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
         resetSutState()
 
-        val ei = fitness.computeWholeAchievedCoverageForPostProcessing(base)
+        statefulTripleUnderEvaluation = true
+        val ei = try {
+            fitness.computeWholeAchievedCoverageForPostProcessing(base)
+        } finally {
+            statefulTripleUnderEvaluation = false
+        }
         if (ei == null) {
             log.warn("Failed to evaluate constructed stateful-authorization individual")
             return false

@@ -558,6 +558,9 @@ class RestSecurityOracle {
         if (!config.isEnabledFaultCategory(ExperimentalFaultCategory.SECURITY_STATEFUL_AUTHORIZATION)) {
             return
         }
+        if (!restSecurityBuilder.statefulTripleUnderEvaluation) {
+            return
+        }
 
         val actions = individual.seeMainExecutableActions()
 
