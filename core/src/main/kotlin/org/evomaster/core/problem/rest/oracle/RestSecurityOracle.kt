@@ -572,12 +572,15 @@ class RestSecurityOracle {
             return StatusGroup.G_2xx.isInGroup(code)
         }
 
+        val twoCredentialJudgment = config.statefulAuthzTwoCredentialJudgment
+
         for (srcIndex in actions.indices) {
             val source = actions[srcIndex]
             if (source.auth is NoAuth
                 || !isAllowed(source)
                 || source.verb !in listOf(HttpVerb.PUT, HttpVerb.PATCH, HttpVerb.POST, HttpVerb.DELETE)
-                || RestSecurityBuilder.looksLikePermissionReducingTransition(source, config.statefulAuthzTransition)) {
+                || (!twoCredentialJudgment
+                    && RestSecurityBuilder.looksLikePermissionReducingTransition(source, config.statefulAuthzTransition))) {
                 continue
             }
 
@@ -595,7 +598,8 @@ class RestSecurityOracle {
                     val t = actions[it]
                     t.auth.isDifferentFrom(source.auth)
                         && isAllowed(t)
-                        && RestSecurityBuilder.looksLikePermissionReducingTransition(t, config.statefulAuthzTransition)
+                        && (twoCredentialJudgment
+                            || RestSecurityBuilder.looksLikePermissionReducingTransition(t, config.statefulAuthzTransition))
                 }
                 if (!hasTransition) {
                     continue

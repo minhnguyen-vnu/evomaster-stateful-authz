@@ -468,8 +468,6 @@ class RestSecurityBuilder : TimeBoxedPhase {
             }
         }
 
-        // local copy with non-null type: avoids capturing a deferred-initialized val
-        // (and relying on a smart cast) inside the local function below
         val transitionOp: RestCallAction = transition
 
         maxStatefulAttempts = if (declared != null) {
@@ -682,10 +680,10 @@ class RestSecurityBuilder : TimeBoxedPhase {
         }
 
         if (StatusGroup.G_2xx.isInGroup(followUpCode!!)
-            && !reLoginProbeConfirmsPrivilegeRemoved(victimSlice)) {
+            && !privilegeRemovalConfirmed(victimSlice, base, followUp, ei)) {
             LoggingUtil.getInfoLogger().info(
                 "Discarded an UNCONFIRMED stateful-authorization (MR-A1) attempt on ${source.getName()}:" +
-                    " re-logging the victim in did not show the privilege removed" +
+                    " ${unconfirmedReason()}" +
                     " (victim '${victimAuth.name}', operator '${operator.name}', codes $observed)"
             )
             return false
@@ -704,6 +702,93 @@ class RestSecurityBuilder : TimeBoxedPhase {
         }
         archive.addIfNeeded(ei)
         return true
+    }
+
+    private fun privilegeRemovalConfirmed(
+        victimSlice: RestIndividual,
+        base: RestIndividual,
+        followUp: RestCallAction,
+        ei: EvaluatedIndividual<RestIndividual>
+    ): Boolean =
+        if (config.statefulAuthzTwoCredentialJudgment) {
+            freshCredentialDeniesFollowUp(base, followUp, ei)
+        } else {
+            reLoginProbeConfirmsPrivilegeRemoved(victimSlice)
+        }
+
+    private fun unconfirmedReason(): String =
+        if (config.statefulAuthzTwoCredentialJudgment) {
+            "the same request sent with a freshly issued victim credential was not denied"
+        } else {
+            "re-logging the victim in did not show the privilege removed"
+        }
+
+    private fun inconclusiveProbe(reason: String): Boolean {
+        LoggingUtil.getInfoLogger().info(
+            "Stateful-authorization fresh-credential probe INCONCLUSIVE: $reason"
+        )
+        return false
+    }
+
+    private fun freshCredentialDeniesFollowUp(
+        base: RestIndividual,
+        followUp: RestCallAction,
+        ei: EvaluatedIndividual<RestIndividual>
+    ): Boolean {
+
+        val probeAction = followUp.copy() as RestCallAction
+        probeAction.resetLocalIdRecursively()
+
+        val chainedId = followUp.usePreviousLocationId
+        if (chainedId != null) {
+            val creator = base.seeMainExecutableActions().firstOrNull {
+                it.saveCreatedResourceLocation
+                    && it.isPotentialActionForCreation()
+                    && it.hasLocalId()
+                    && it.creationLocationId() == chainedId
+            } ?: return inconclusiveProbe("no action in the triple created the resource the follow-up points at")
+
+            val creation = ei.seeResult(creator.getLocalId()) as? RestCallResult
+                ?: return inconclusiveProbe("the creating action ${creator.getName()} has no recorded result")
+
+            val resourceId = creation.getLocation()?.trimEnd('/')?.substringAfterLast('/')
+                ?: creation.getResourceId()?.value
+                ?: return inconclusiveProbe(
+                    "the creating action ${creator.getName()} returned neither a location header nor an id in its body")
+
+            val pathParams = probeAction.parameters.filterIsInstance<PathParam>()
+            if (pathParams.size != 1) {
+                return inconclusiveProbe("the follow-up has ${pathParams.size} path parameters, cannot place '$resourceId'")
+            }
+            if (!pathParams[0].primaryGene().setFromStringValue(resourceId)) {
+                return inconclusiveProbe("could not put the created resource id '$resourceId' into the follow-up path")
+            }
+            probeAction.usePreviousLocationId = null
+        }
+
+        val probe = RestIndividual(mutableListOf(probeAction), SampleType.SECURITY)
+        probe.doInitializeLocalId()
+        probe.ensureFlattenedStructure()
+
+        val pei = fitness.computeWholeAchievedCoverageForPostProcessing(probe)
+            ?: return inconclusiveProbe("the probe could not be evaluated")
+
+        val code = (pei.seeResult(probeAction.getLocalId()) as? RestCallResult)?.getStatusCode()
+
+        LoggingUtil.getInfoLogger().info(
+            "Stateful-authorization fresh-credential probe: ${probeAction.getName()}" +
+                "[${probeAction.auth.name}]=$code"
+        )
+
+        if (code == null) {
+            return inconclusiveProbe("the follow-up was not executed")
+        }
+
+        return if (probeAction.verb == HttpVerb.PUT) {
+            !StatusGroup.G_2xx.isInGroup(code)
+        } else {
+            code == 403
+        }
     }
 
     private fun reLoginProbeConfirmsPrivilegeRemoved(victimSlice: RestIndividual): Boolean {
