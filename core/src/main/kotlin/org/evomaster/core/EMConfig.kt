@@ -3069,8 +3069,9 @@ class EMConfig {
             " triple has been executed, the same follow-up request is sent again in a separate test, in which" +
             " the victim logs in after the transition and therefore uses a freshly issued credential. The fault" +
             " is reported only when the source is 2xx, the transition is 2xx, the follow-up with the" +
-            " pre-transition credential is 2xx, and the follow-up with the fresh credential is denied, ie any" +
-            " non-2xx for PUT and 403 for the other verbs. When true, neither the built-in transition" +
+            " pre-transition credential is 2xx, and the follow-up with the fresh credential is denied, ie 403" +
+            " for every verb; a 2xx is not a denial, and any other status code is inconclusive and reports" +
+            " nothing. When true, neither the built-in transition" +
             " vocabulary nor the re-login probe on the victim slice takes part in the judgment. When false" +
             " (the default), the triple is judged exactly as before.")
     var statefulAuthzTwoCredentialJudgment = false

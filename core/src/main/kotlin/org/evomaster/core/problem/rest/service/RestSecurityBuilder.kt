@@ -1,5 +1,7 @@
 package org.evomaster.core.problem.rest.service
 
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.google.inject.Inject
 import com.webfuzzing.commons.faults.DefinedFaultCategory
 import org.evomaster.core.EMConfig
@@ -35,11 +37,16 @@ import javax.ws.rs.core.MediaType
 import org.evomaster.core.search.gene.string.StringGene
 
 import org.evomaster.core.search.*
+import org.evomaster.core.search.gene.BooleanGene
 import org.evomaster.core.search.gene.Gene
+import org.evomaster.core.search.gene.ObjectGene
+import org.evomaster.core.search.gene.collection.ArrayGene
 import org.evomaster.core.search.gene.collection.EnumGene
-import org.evomaster.core.search.gene.numeric.IntegerGene
-import org.evomaster.core.search.gene.numeric.LongGene
+import org.evomaster.core.search.gene.numeric.NumberGene
 import org.evomaster.core.search.gene.utils.GeneUtils
+import org.evomaster.core.search.gene.wrapper.OptionalGene
+import org.evomaster.core.search.gene.wrapper.ChoiceGene
+import org.evomaster.core.search.gene.wrapper.SelectableWrapperGene
 import org.evomaster.core.search.service.Archive
 import org.evomaster.core.search.service.FitnessFunction
 import org.evomaster.core.search.service.IdMapper
@@ -64,8 +71,54 @@ class RestSecurityBuilder : TimeBoxedPhase {
     companion object {
         private val log: Logger = LoggerFactory.getLogger(RestSecurityBuilder::class.java)
 
-        private val TRANSITION_PATH_SIGNALS =
-            listOf("role","permission","member","subscription","plan","owner","grant","access")
+        private const val LEXICON_RESOURCE = "/stateful-authz-lexicon.csv"
+
+        private const val MAX_TRANSITION_CANDIDATES = 8
+
+        private fun loadLexicon(kind: String): List<Pair<String, Double>> {
+            val stream = RestSecurityBuilder::class.java.getResourceAsStream(LEXICON_RESOURCE)
+            if (stream == null) {
+                log.warn("Stateful-authorization lexicon $LEXICON_RESOURCE is missing from the classpath:" +
+                        " no transition can be inferred and oracle 970 will never be raised")
+                return emptyList()
+            }
+            val entries = stream.bufferedReader().readLines()
+                .map { it.trim().split(",") }
+                .filter { it.size == 3 && it[0] == kind }
+                .mapNotNull { row -> row[2].toDoubleOrNull()?.let { row[1].lowercase() to it } }
+                .sortedByDescending { it.second }
+            if (entries.isEmpty()) {
+                log.warn("Stateful-authorization lexicon $LEXICON_RESOURCE carries no usable \"$kind\" entry:" +
+                        " no transition can be inferred and oracle 970 will never be raised")
+            }
+            return entries
+        }
+
+        private val TRANSITION_PATH_LEXICON = loadLexicon("path")
+
+        private val TRANSITION_USER_PARAM_LEXICON = loadLexicon("param")
+
+        fun transitionPathScore(hay: String): Double =
+            TRANSITION_PATH_LEXICON.filter { hay.contains(it.first) }.maxOfOrNull { it.second } ?: 0.0
+
+        private val ADMIN_FLAG_FIELD_SIGNALS = listOf("is_admin", "isadmin", "is_superuser", "is_superadmin", "is_staff")
+
+        private const val ADMIN_FLAG_TRANSITION_SCORE = 0.6
+
+        fun transitionScore(hay: String): Double =
+            maxOf(
+                transitionPathScore(hay),
+                if (ADMIN_FLAG_FIELD_SIGNALS.any { hay.contains(it) }) ADMIN_FLAG_TRANSITION_SCORE else 0.0
+            )
+
+        private fun bodyFieldNames(a: RestCallAction): List<String> =
+            a.parameters.filterIsInstance<BodyParam>()
+                .mapNotNull { it.primaryGene().flatView().filterIsInstance<ObjectGene>().firstOrNull() }
+                .flatMap { it.fields }
+                .map { it.name }
+
+        fun transitionHay(a: RestCallAction): String =
+            (a.path.toString() + " " + a.getName() + " " + bodyFieldNames(a).joinToString(" ")).lowercase()
 
         private val TRANSITION_VERBS =
             listOf(HttpVerb.PUT, HttpVerb.PATCH, HttpVerb.POST, HttpVerb.DELETE)
@@ -83,8 +136,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
             if (a.verb !in TRANSITION_VERBS) {
                 return false
             }
-            val hay = (a.path.toString() + " " + a.getName()).lowercase()
-            return TRANSITION_PATH_SIGNALS.any { hay.contains(it) }
+            return transitionScore(transitionHay(a)) > 0.0
         }
 
         data class DeclaredTransition(
@@ -359,8 +411,9 @@ class RestSecurityBuilder : TimeBoxedPhase {
         TODO("Not yet implemented")
     }
 
-    private val transitionPathSignals = TRANSITION_PATH_SIGNALS
     private val transitionUserParamSignals = listOf("username","userid","user_id","user","account","member","subject","principal","id")
+    private val userEmailParamSignals = listOf("email")
+    private val emptyRoleList = "[]"
     private val roleFieldSignals = listOf("role","plan","permission","level","tier")
     private val roleLowPrivSignals = listOf("view","read","guest","basic","free","member","user","none","restrict","limited")
     private val roleHighPrivSignals = listOf("admin","owner","super","root","manage","write","edit","power","full")
@@ -383,6 +436,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
     private var lastSourceCode: Int? = null
     private var lastTransitionCode: Int? = null
+    private var transitionNotFoundSeen = false
 
     var statefulTripleUnderEvaluation = false
         private set
@@ -442,10 +496,9 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
         val declared = parseDeclaredTransition(config.statefulAuthzTransition)
 
-        val transition: RestCallAction?
-        val reducedRoleCandidates: List<String>
+        val queue: List<Pair<RestCallAction, List<String>>>
         if (declared != null) {
-            transition = actionDefinitions.firstOrNull {
+            val transition = actionDefinitions.firstOrNull {
                 it.verb == declared.verb && it.path.toString().equals(declared.path, ignoreCase = true)
             }
             if (transition == null) {
@@ -453,22 +506,36 @@ class RestSecurityBuilder : TimeBoxedPhase {
                         " '${declared.verb} ${declared.path}' is not in the schema; ignoring it")
                 return
             }
-            reducedRoleCandidates = listOf("")
+            queue = listOf(transition to listOf(""))
         } else {
-            transition = findPermissionReducingTransition()
-            if (transition == null) {
+            val ranked = rankPermissionReducingTransitions()
+            if (ranked.isEmpty()) {
                 log.debug("Skipping stateful-authorization: no permission-reducing transition endpoint found")
                 return
             }
-            reducedRoleCandidates = harvestReducedRoleCandidates(transition)
-            if (reducedRoleCandidates.isEmpty()) {
+            val viable = mutableListOf<Pair<RestCallAction, List<String>>>()
+            for (candidate in ranked.take(MAX_TRANSITION_CANDIDATES)) {
+                if (routeLooksMissing(candidate)) {
+                    log.debug("Stateful-authorization transition candidate ${candidate.getName()}" +
+                            " skipped: every call on its path and parent path returned 404")
+                    continue
+                }
+                val values = harvestReducedRoleCandidates(candidate)
+                log.debug("Stateful-authorization transition candidate ${candidate.getName()}" +
+                        " score ${transitionScore(transitionHay(candidate))}" +
+                        " userParam ${hasUserParam(candidate)}" +
+                        " reducedRoleValues ${values.size}")
+                if (values.isNotEmpty()) {
+                    viable.add(candidate to values)
+                }
+            }
+            if (viable.isEmpty()) {
                 log.debug("Skipping stateful-authorization: no reduced role value could be proposed" +
-                        " for ${transition.getName()}")
+                        " for any of ${ranked.size} transition candidates")
                 return
             }
+            queue = viable
         }
-
-        val transitionOp: RestCallAction = transition
 
         maxStatefulAttempts = if (declared != null) {
             MAX_STATEFUL_TRIPLE_ATTEMPTS_DECLARED
@@ -476,45 +543,82 @@ class RestSecurityBuilder : TimeBoxedPhase {
             MAX_STATEFUL_TRIPLE_ATTEMPTS
         }
 
-        fun guardedCandidatesFor(verbs: List<HttpVerb>) = verbs.flatMap { verb ->
-            RestIndividualSelectorUtils.getAllActionDefinitions(actionDefinitions, verb)
-                .filter { op ->
-                    op.path != transitionOp.path
-                        && RestIndividualSelectorUtils.findIndividuals(
-                            individualsInSolution, verb, op.path, status = 403
-                        ).isNotEmpty()
+        for ((transitionOp, reducedRoleCandidates) in queue) {
+            if (declared == null) {
+                log.debug("Stateful-authorization transition chosen: ${transitionOp.getName()}")
+                log.debug("Stateful-authorization reduced role values: $reducedRoleCandidates")
+            }
+            transitionNotFoundSeen = false
+
+            fun guardedCandidatesFor(verbs: List<HttpVerb>) = verbs.flatMap { verb ->
+                RestIndividualSelectorUtils.getAllActionDefinitions(actionDefinitions, verb)
+                    .filter { op ->
+                        op.path != transitionOp.path
+                            && RestIndividualSelectorUtils.findIndividuals(
+                                individualsInSolution, verb, op.path, status = 403
+                            ).isNotEmpty()
+                    }
+                    .map { verb to it }
+            }
+
+            val putPatchCandidates = guardedCandidatesFor(listOf(HttpVerb.PUT, HttpVerb.PATCH))
+            val candidates = putPatchCandidates.takeIf { l ->
+                l.any { (verb, op) ->
+                    RestIndividualSelectorUtils.findIndividuals(
+                        individualsInSolution, verb, op.path,
+                        statusGroup = StatusGroup.G_2xx, authenticated = true
+                    ).isNotEmpty()
                 }
-                .map { verb to it }
-        }
+            } ?: guardedCandidatesFor(listOf(HttpVerb.POST))
 
-        val candidates = guardedCandidatesFor(listOf(HttpVerb.PUT, HttpVerb.PATCH))
-            .ifEmpty { guardedCandidatesFor(listOf(HttpVerb.POST)) }
-
-        val ordered = if (declared == null) candidates else candidates.sortedWith(
-            compareBy(
-                { distinctUsersOn(it.first, it.second.path, statusGroup = StatusGroup.G_2xx) },
-                { -distinctUsersOn(it.first, it.second.path, status = 403) }
+            val ordered = if (declared == null) candidates else candidates.sortedWith(
+                compareBy(
+                    { distinctUsersOn(it.first, it.second.path, statusGroup = StatusGroup.G_2xx) },
+                    { -distinctUsersOn(it.first, it.second.path, status = 403) }
+                )
             )
-        )
+            log.debug("Stateful-authorization guarded source candidates: ${ordered.size}" +
+                    " ${ordered.map { "${it.first}:${it.second.path}" }}")
 
-        for ((verb, op) in ordered) {
-            run {
+            sources@ for ((verb, op) in ordered) {
+                run {
 
-                if (hasPhaseTimedOut()) return
+                    if (hasPhaseTimedOut()) {
+                        log.debug("Stateful-authorization: phase timed out before source $verb:${op.path}")
+                        return
+                    }
 
-                val victimCandidates = RestIndividualSelectorUtils.findAndSlice(
-                    individualsInSolution, verb, op.path,
-                    statusGroup = StatusGroup.G_2xx, authenticated = true
-                ).sortedBy { it.size() }
-                    .distinctBy { it.seeMainExecutableActions().last().auth.name }
+                    val victimCandidates = RestIndividualSelectorUtils.findAndSlice(
+                        individualsInSolution, verb, op.path,
+                        statusGroup = StatusGroup.G_2xx, authenticated = true
+                    ).sortedBy { it.size() }
+                        .distinctBy { it.seeMainExecutableActions().last().auth.name }
+                    log.debug("Stateful-authorization source $verb:${op.path} victims" +
+                            " ${victimCandidates.map { it.seeMainExecutableActions().last().auth.name }}")
 
-                for (victimSlice in victimCandidates) {
-                    if (hasPhaseTimedOut()) return
-                    if (statefulTripleAttempts >= maxStatefulAttempts) return
-                    if (buildStatefulAuthzTriple(victimSlice, transitionOp, reducedRoleCandidates, declared)) break
+                    for (victimSlice in victimCandidates) {
+                        if (hasPhaseTimedOut()) {
+                            log.debug("Stateful-authorization: phase timed out on source $verb:${op.path}")
+                            return
+                        }
+                        if (statefulTripleAttempts >= maxStatefulAttempts) {
+                            log.debug("Stateful-authorization: attempt cap $maxStatefulAttempts reached")
+                            return
+                        }
+                        if (buildStatefulAuthzTriple(victimSlice, transitionOp, reducedRoleCandidates, declared)) break
+                        if (declared == null && transitionNotFoundSeen) {
+                            break@sources
+                        }
+                    }
                 }
             }
+            if (!transitionNotFoundSeen) {
+                break
+            }
+            log.debug("Stateful-authorization transition ${transitionOp.getName()} returned 404 after a 2xx source;" +
+                    " trying the next candidate")
         }
+        log.debug("Stateful-authorization: sources exhausted after $statefulTripleAttempts triple attempts")
     }
 
     private fun buildStatefulAuthzTriple(
@@ -528,7 +632,10 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
         resetSutState()
 
-        if (privilegeReducedInPhase.contains(victimAuth.name)) return false
+        if (privilegeReducedInPhase.contains(victimAuth.name)) {
+            log.debug("Stateful-authorization: victim '${victimAuth.name}' already reduced in this phase")
+            return false
+        }
 
         val operators = authSettings.getAllOthers(victimAuth.name, HttpWsAuthenticationInfo::class.java)
             .filter { !privilegeReducedInPhase.contains(it.name) }
@@ -538,9 +645,16 @@ class RestSecurityBuilder : TimeBoxedPhase {
                     statusGroup = StatusGroup.G_2xx, authenticatedWith = o.name
                 ).isNotEmpty()
             }
+        log.debug("Stateful-authorization victim '${victimAuth.name}' operators ${operators.map { it.name }}")
+
+        val roleValues = if (declared != null) reducedRoleCandidates else {
+            val current = victimRoleValues(victimAuth.name).filter { !isLowPrivRole(it) }
+            reducedRoleCandidates.filter { v -> current.none { it.equals(v, ignoreCase = true) } }
+                .also { log.debug("Stateful-authorization victim '${victimAuth.name}' current roles $current, reduced role values $it") }
+        }
 
         for (operator in operators) {
-            for (reducedRole in reducedRoleCandidates) {
+            for (reducedRole in roleValues) {
                 if (hasPhaseTimedOut()) return false
                 if (statefulTripleAttempts >= maxStatefulAttempts) return false
 
@@ -554,7 +668,9 @@ class RestSecurityBuilder : TimeBoxedPhase {
                 if (privilegeReducedInPhase.contains(victimAuth.name)) {
                     return false
                 }
-                break
+                if (!transitionRejectedRoleValue()) {
+                    break
+                }
             }
         }
 
@@ -563,7 +679,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         if (declared == null && operatorsRefused && src != null && StatusGroup.G_2xx.isInGroup(src)) {
 
             val elevatedCandidates =
-                harvestElevatedRoleCandidates(transitionDef, reducedRoleCandidates.firstOrNull() ?: "")
+                harvestElevatedRoleCandidates(transitionDef, roleValues.firstOrNull() ?: "")
 
             for (operator in operators) {
                 for (elevated in elevatedCandidates) {
@@ -575,19 +691,29 @@ class RestSecurityBuilder : TimeBoxedPhase {
                         continue
                     }
 
-                    for (reducedRole in reducedRoleCandidates) {
+                    for (reducedRole in roleValues) {
                         val before = statefulTripleAttempts
                         if (executeStatefulAuthzTriple(victimSlice, transitionDef, reducedRole, operator, declared)) {
                             return true
                         }
                         if (statefulTripleAttempts == before) continue
                         if (privilegeReducedInPhase.contains(victimAuth.name)) return false
-                        break
+                        if (!transitionRejectedRoleValue()) break
                     }
                 }
             }
         }
         return false
+    }
+
+    private fun isLowPrivRole(value: String): Boolean {
+        val lv = value.lowercase()
+        return roleLowPrivSignals.any { lv.contains(it) } && roleHighPrivSignals.none { lv.contains(it) }
+    }
+
+    private fun transitionRejectedRoleValue(): Boolean {
+        val code = lastTransitionCode ?: return false
+        return code in 400..599 && code !in setOf(401, 403, 404)
     }
 
     private fun executeStatefulAuthzTriple(
@@ -622,6 +748,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
                 log.debug("Stateful-authorization: could not set reduced role '$reducedRole' on ${transition.getName()}")
                 return false
             }
+            keepOnlyTargetFields(transition)
+            setUserNameFieldsToVictim(transition, victimAuth.name)
         }
         base.addMainActionInEmptyEnterpriseGroup(action = transition)
 
@@ -660,6 +788,9 @@ class RestSecurityBuilder : TimeBoxedPhase {
         val followUpCode = statusOf(followUp)
         lastSourceCode = sourceCode
         lastTransitionCode = transitionCode
+        if (transitionCode == 404 && sourceCode != null && StatusGroup.G_2xx.isInGroup(sourceCode)) {
+            transitionNotFoundSeen = true
+        }
         val observed = listOf(sourceCode, transitionCode, followUpCode)
             .joinToString("/") { it?.toString() ?: "-" }
 
@@ -784,10 +915,11 @@ class RestSecurityBuilder : TimeBoxedPhase {
             return inconclusiveProbe("the follow-up was not executed")
         }
 
-        return if (probeAction.verb == HttpVerb.PUT) {
-            !StatusGroup.G_2xx.isInGroup(code)
-        } else {
-            code == 403
+        return when {
+            code == 403 -> true
+            StatusGroup.G_2xx.isInGroup(code) -> false
+            else -> inconclusiveProbe(
+                "the follow-up with the fresh credential returned $code, neither 403 nor 2xx")
         }
     }
 
@@ -805,42 +937,50 @@ class RestSecurityBuilder : TimeBoxedPhase {
         return lastObserved == 403
     }
 
-    private fun findPermissionReducingTransition(): RestCallAction? {
+    private fun hasUserParam(a: RestCallAction) = allGenes(a).any { g ->
+        val n = g.name.lowercase()
+        TRANSITION_USER_PARAM_LEXICON.any { n == it.first || n.contains(it.first) }
+    }
+
+    private fun rankPermissionReducingTransitions(): List<RestCallAction> {
         val preferredOrder = listOf(HttpVerb.PUT, HttpVerb.PATCH, HttpVerb.POST, HttpVerb.DELETE)
         return actionDefinitions
-            .filter { it.verb in preferredOrder }
-            .sortedBy { preferredOrder.indexOf(it.verb) }
-            .firstOrNull { a ->
-                val hay = (a.path.toString() + " " + a.getName()).lowercase()
-                val pathSignal = transitionPathSignals.any { hay.contains(it) }
-                val hasUserParam = allGenes(a).any { g ->
-                    val n = g.name.lowercase()
-                    transitionUserParamSignals.any { n == it || n.contains(it) }
-                }
-                pathSignal && hasUserParam
-            }
+            .filter { it.verb in preferredOrder && transitionScore(transitionHay(it)) > 0.0 }
+            .sortedWith(
+                compareByDescending<RestCallAction> { transitionScore(transitionHay(it)) }
+                    .thenByDescending { hasUserParam(it) }
+                    .thenBy { preferredOrder.indexOf(it.verb) }
+            )
     }
 
     private fun harvestReducedRoleCandidates(transition: RestCallAction): List<String> {
-
-        val enumVocab = (allGenes(transition) + actionDefinitions.flatMap { allGenes(it) })
-            .filterIsInstance<EnumGene<*>>()
-            .flatMap { it.values.map { v -> v.toString() } }
-            .distinct()
-
-        val lowPrivEnum = enumVocab.filter { v ->
-            val lv = v.lowercase()
-            roleLowPrivSignals.any { lv.contains(it) } && roleHighPrivSignals.none { lv.contains(it) }
-        }
 
         val roleGenes = allGenes(transition).filter { g ->
             val n = g.name.lowercase()
             roleFieldSignals.any { n == it || n.contains(it) }
         }
-        val numeric = if (roleGenes.any { it is IntegerGene || it is LongGene }) numericRoleCandidates else emptyList()
-        val strings = if (roleGenes.any { it is StringGene }) stringRoleCandidates else emptyList()
+        val adminFlagGenes = allGenes(transition).filter { g ->
+            g is BooleanGene && ADMIN_FLAG_FIELD_SIGNALS.any { g.name.lowercase().contains(it) }
+        }
+        if (roleGenes.isEmpty() && adminFlagGenes.isEmpty()) {
+            return emptyList()
+        }
 
-        return (lowPrivEnum + numeric + (enumVocab - lowPrivEnum.toSet()) + strings).distinct()
+        val contentTypeGenes = transition.parameters.filterIsInstance<BodyParam>().map { it.contentTypeGene }
+        val enumVocab = allGenes(transition)
+            .filter { g -> contentTypeGenes.none { it === g } }
+            .filterIsInstance<EnumGene<*>>()
+            .flatMap { it.values.map { v -> v.toString() } }
+            .distinct()
+
+        val lowPrivEnum = enumVocab.filter { isLowPrivRole(it) }
+
+        val numeric = if (roleGenes.any { it is NumberGene<*> }) numericRoleCandidates else emptyList()
+        val strings = if (roleGenes.any { it is StringGene }) stringRoleCandidates else emptyList()
+        val empty = if (roleArrays(transition).isNotEmpty()) listOf(emptyRoleList) else emptyList()
+        val adminFalse = if (adminFlagGenes.isNotEmpty()) listOf("false") else emptyList()
+
+        return (adminFalse + lowPrivEnum + empty + numeric + (enumVocab - lowPrivEnum.toSet()) + strings).distinct()
     }
 
     private fun harvestElevatedRoleCandidates(transition: RestCallAction, exclude: String): List<String> {
@@ -859,7 +999,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
             val n = g.name.lowercase()
             roleFieldSignals.any { n == it || n.contains(it) }
         }
-        val numeric = if (roleGenes.any { it is IntegerGene || it is LongGene }) elevatedNumericRoleCandidates else emptyList()
+        val numeric = if (roleGenes.any { it is NumberGene<*> }) elevatedNumericRoleCandidates else emptyList()
         val strings = if (roleGenes.any { it is StringGene }) elevatedStringRoleCandidates else emptyList()
 
         return (highPrivEnum + numeric + strings).distinct().filter { it != exclude }
@@ -882,6 +1022,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
         action.auth = restorer
         if (!setUserTargetToVictim(action, target)) return false
         if (!setAllRoleFieldsTo(action, elevatedRole)) return false
+        keepOnlyTargetFields(action)
+        setUserNameFieldsToVictim(action, target)
 
         val base = victimSlice.copy() as RestIndividual
         base.addMainActionInEmptyEnterpriseGroup(action = action)
@@ -908,28 +1050,265 @@ class RestSecurityBuilder : TimeBoxedPhase {
     private fun allGenes(action: RestCallAction): List<Gene> =
         action.seeTopGenes().flatMap { it.flatView() }
 
-    private fun setUserTargetToVictim(action: RestCallAction, victimName: String): Boolean =
-        setInParams(action.parameters.filterIsInstance<PathParam>(), transitionUserParamSignals, victimName)
-            || setInParams(action.parameters.filterIsInstance<BodyParam>(), transitionUserParamSignals, victimName)
+    private fun setUserTargetToVictim(action: RestCallAction, victimName: String): Boolean {
+        val ids = victimIdentifiers(victimName)
+        return setUserInParams(action.parameters.filterIsInstance<PathParam>(), victimName, ids)
+            || setUserInParams(action.parameters.filterIsInstance<BodyParam>(), victimName, ids)
             || setInQueryParamsTopLevel(action, transitionUserParamSignals, victimName)
+    }
+
+    private fun setUserInParams(params: List<Param>, victimName: String, ids: List<String>): Boolean {
+        val specific = transitionUserParamSignals.filter { it != "id" }
+        for (signals in listOf(specific, userEmailParamSignals, listOf("id"))) {
+            for (p in params) {
+                for (g in p.primaryGene().flatView()) {
+                    val n = g.name.lowercase()
+                    if (signals.none { n == it || n.contains(it) }) {
+                        continue
+                    }
+                    val values = if (n.endsWith("id")) ids + victimName else listOf(victimName) + ids
+                    if (values.any { trySetFromStringValue(g, it) }) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    private val victimIdCache = mutableMapOf<String, List<String>>()
+
+    private val victimObjectCache = mutableMapOf<String, List<Pair<HttpVerb, JsonNode>>>()
+
+    private fun victimIdentifiers(victimName: String): List<String> = victimIdCache.getOrPut(victimName) {
+        val found = victimObjects(victimName)
+            .map { it.second }
+            .flatMap { o -> victimIdFields.mapNotNull { f -> o.get(f)?.takeIf { it.isValueNode && !it.isNull }?.asText() } }
+            .distinct()
+        log.debug("Stateful-authorization victim '$victimName' identifiers $found")
+        found
+    }
+
+    private fun victimRoleValues(victimName: String): List<String> =
+        victimObjects(victimName)
+            .filter { it.first == HttpVerb.GET }
+            .map { it.second }
+            .flatMap { o ->
+                o.fields().asSequence()
+                    .filter { (k, _) ->
+                        val n = k.lowercase()
+                        roleFieldSignals.any { n == it || n.contains(it) }
+                    }
+                    .flatMap { (_, v) ->
+                        if (v.isObject) roleObjectFields.mapNotNull { f -> v.get(f) }.asSequence() else sequenceOf(v)
+                    }
+                    .filter { it.isValueNode && !it.isNull }
+                    .map { it.asText() }
+                    .toList()
+            }
+            .filter { it.isNotBlank() }
+            .distinct()
+
+    private fun victimObjects(victimName: String): List<Pair<HttpVerb, JsonNode>> = victimObjectCache.getOrPut(victimName) {
+        val mapper = ObjectMapper()
+        val objects = mutableListOf<Pair<HttpVerb, JsonNode>>()
+        for (ea in RestIndividualSelectorUtils.findEvaluatedActions(
+            individualsInSolution, statusGroup = StatusGroup.G_2xx
+        )) {
+            val body = (ea.result as? RestCallResult)?.getBody() ?: continue
+            if (!body.contains(victimName)) {
+                continue
+            }
+            val node = try {
+                mapper.readTree(body)
+            } catch (e: Exception) {
+                continue
+            }
+            val verb = (ea.action as? RestCallAction)?.verb ?: continue
+            val found = mutableListOf<JsonNode>()
+            collectObjectsOf(node, victimName, found)
+            found.forEach { objects.add(verb to it) }
+        }
+        objects.sortedBy { if (namedByUserField(it.second, victimName)) 0 else 1 }
+    }
+
+    private fun namedByUserField(node: JsonNode, victimName: String): Boolean =
+        node.fields().asSequence().any { (k, v) ->
+            k.lowercase() in victimUserNameFields && v.isTextual && v.asText().equals(victimName, ignoreCase = true)
+        }
+
+    private fun collectObjectsOf(node: JsonNode, victimName: String, into: MutableList<JsonNode>) {
+        if (node.isObject) {
+            val named = victimNameFields.any { f ->
+                node.get(f)?.let { it.isTextual && it.asText().equals(victimName, ignoreCase = true) } == true
+            }
+            if (named) {
+                into.add(node)
+            }
+        }
+        if (node.isContainerNode) {
+            node.forEach { collectObjectsOf(it, victimName, into) }
+        }
+    }
+
+    private val victimNameFields = listOf("login", "username", "userName", "user_name", "name")
+
+    private val victimIdFields = listOf("userId", "user_id", "id", "uid")
+
+    private val victimUserNameFields = listOf("login", "username", "user_name")
+
+    private val roleObjectFields = listOf("id", "name")
+
+    private fun setUserNameFieldsToVictim(action: RestCallAction, victimName: String) {
+        val set = action.parameters.filterIsInstance<BodyParam>()
+            .flatMap { it.primaryGene().flatView() }
+            .filter { g ->
+                g !is OptionalGene
+                    && (g.parent as? OptionalGene)?.isActive != false
+                    && g.name.lowercase() in victimUserNameFields
+                    && trySetFromStringValue(g, victimName)
+            }
+            .map { it.name }
+        if (set.isNotEmpty()) {
+            log.debug("Stateful-authorization: set user-name fields $set to '$victimName' on ${action.getName()}")
+        }
+    }
+
+    private fun routeLooksMissing(candidate: RestCallAction): Boolean {
+        val path = candidate.path.toString()
+        if (!path.substringAfterLast("/").startsWith("{")) {
+            return false
+        }
+        val parent = path.substringBeforeLast("/")
+        if (parent.contains("{")) {
+            return false
+        }
+        val codes = RestIndividualSelectorUtils.findEvaluatedActions(individualsInSolution, authenticated = true)
+            .filter { (it.action as? RestCallAction)?.path?.toString() in setOf(path, parent) }
+        val onParent = codes.any { (it.action as RestCallAction).path.toString() == parent }
+        return onParent && codes.all { (it.result as? RestCallResult)?.getStatusCode() == 404 }
+    }
 
     private fun setRoleFieldToReduced(action: RestCallAction, reducedRole: String): Boolean =
-        setInParams(action.parameters.filterIsInstance<BodyParam>(), roleFieldSignals, reducedRole)
+        if (reducedRole == emptyRoleList) clearRoleArrays(action)
+        else setInParams(action.parameters.filterIsInstance<BodyParam>(), roleFieldSignals, reducedRole)
+            || setAdminFlagActive(action, reducedRole)
             || setInQueryParamsTopLevel(action, roleFieldSignals, reducedRole)
+            || setInQueryParamsTopLevel(action, ADMIN_FLAG_FIELD_SIGNALS, reducedRole)
 
-    private fun setAllRoleFieldsTo(action: RestCallAction, value: String): Boolean {
+    private fun roleArrays(action: RestCallAction): List<ArrayGene<*>> =
+        action.parameters.filterIsInstance<BodyParam>()
+            .flatMap { it.primaryGene().flatView() }
+            .filterIsInstance<ArrayGene<*>>()
+            .filter { a ->
+                val n = a.name.lowercase()
+                roleFieldSignals.any { n == it || n.contains(it) } && (a.minSize ?: 0) == 0
+            }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun clearRoleArrays(action: RestCallAction): Boolean {
+        val arrays = roleArrays(action)
+        for (a in arrays) {
+            val array = a as ArrayGene<Gene>
+            array.getViewOfElements().forEach { array.removeExistingElement(it) }
+            var child: Gene = array
+            var p = array.parent
+            while (p is Gene) {
+                when (p) {
+                    is SelectableWrapperGene -> p.isActive = true
+                    is ChoiceGene<*> -> p.selectActiveGene(p.getViewOfChildren().indexOf(child))
+                }
+                child = p
+                p = p.parent
+            }
+        }
+        return arrays.isNotEmpty()
+    }
+
+    private fun setAdminFlagActive(action: RestCallAction, reducedRole: String): Boolean {
+        val target = reducedRole.equals("true", ignoreCase = true)
         var any = false
         for (p in action.parameters.filterIsInstance<BodyParam>()) {
             for (g in p.primaryGene().flatView()) {
                 val n = g.name.lowercase()
-                if (roleFieldSignals.any { n == it || n.contains(it) } && g.setFromStringValue(value)) {
+                if (ADMIN_FLAG_FIELD_SIGNALS.none { n == it || n.contains(it) }) {
+                    continue
+                }
+                val bool = g.flatView().filterIsInstance<BooleanGene>().firstOrNull() ?: continue
+                bool.value = target
+                var child: Gene = bool
+                var par = bool.parent
+                while (par is Gene) {
+                    when (par) {
+                        is SelectableWrapperGene -> par.isActive = true
+                        is ChoiceGene<*> -> par.selectActiveGene(par.getViewOfChildren().indexOf(child))
+                    }
+                    child = par
+                    par = par.parent
+                }
+                any = true
+            }
+        }
+        return any
+    }
+
+    private fun keepOnlyTargetFields(action: RestCallAction) {
+        val userInPath = action.parameters.filterIsInstance<PathParam>().any { p ->
+            val n = p.name.lowercase()
+            transitionUserParamSignals.any { n == it || n.contains(it) }
+        }
+        fun keep(name: String): Boolean {
+            val n = name.lowercase()
+            return roleFieldSignals.any { n == it || n.contains(it) }
+                || ADMIN_FLAG_FIELD_SIGNALS.any { n == it || n.contains(it) }
+                || (!userInPath && transitionUserParamSignals.any { n == it || n.contains(it) })
+        }
+        val removed = mutableListOf<String>()
+        for (p in action.parameters.filterIsInstance<BodyParam>()) {
+            val obj = p.primaryGene().flatView().firstOrNull { it is ObjectGene } as ObjectGene? ?: continue
+            obj.fixedFields.filterIsInstance<OptionalGene>()
+                .filter { it.isActive && !keep(it.name) }
+                .forEach { it.isActive = false; removed.add(it.name) }
+        }
+        for (p in action.parameters.filterIsInstance<QueryParam>()) {
+            val g = p.primaryGene()
+            if (g is OptionalGene && g.isActive && !keep(p.name)) {
+                g.isActive = false
+                removed.add(p.name)
+            }
+        }
+        log.debug("Stateful-authorization: removed optional fields $removed from ${action.getName()}")
+    }
+
+    private fun trySetFromStringValue(g: Gene, value: String): Boolean =
+        try {
+            g.setFromStringValue(value)
+        } catch (e: Exception) {
+            false
+        }
+
+    private fun setAllRoleFieldsTo(action: RestCallAction, value: String): Boolean {
+        var any = false
+        for (p in action.parameters.filterIsInstance<BodyParam>()) {
+            val genes = p.primaryGene().flatView()
+            val objectArrayFields = genes.filter { g ->
+                val n = g.name.lowercase()
+                roleFieldSignals.any { n == it || n.contains(it) }
+                    && g.flatView().any { it is ArrayGene<*> && it.template is ObjectGene }
+            }.flatMap { it.flatView() }
+            for (g in genes) {
+                val n = g.name.lowercase()
+                if (objectArrayFields.any { it === g }) {
+                    continue
+                }
+                if (roleFieldSignals.any { n == it || n.contains(it) } && trySetFromStringValue(g, value)) {
                     any = true
                 }
             }
         }
         for (p in action.parameters.filterIsInstance<QueryParam>()) {
             val n = p.name.lowercase()
-            if (roleFieldSignals.any { n == it || n.contains(it) } && p.primaryGene().setFromStringValue(value)) {
+            if (roleFieldSignals.any { n == it || n.contains(it) } && trySetFromStringValue(p.primaryGene(), value)) {
                 any = true
             }
         }
@@ -943,7 +1322,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
     ): Boolean {
         for (p in action.parameters.filterIsInstance<QueryParam>()) {
             val n = p.name.lowercase()
-            if (signals.any { n == it || n.contains(it) } && p.primaryGene().setFromStringValue(value)) {
+            if (signals.any { n == it || n.contains(it) } && trySetFromStringValue(p.primaryGene(), value)) {
                 return true
             }
         }
@@ -986,7 +1365,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         for (p in params) {
             for (g in p.primaryGene().flatView()) {
                 val n = g.name.lowercase()
-                if (signals.any { n == it || n.contains(it) } && g.setFromStringValue(value)) {
+                if (signals.any { n == it || n.contains(it) } && trySetFromStringValue(g, value)) {
                     return true
                 }
             }
