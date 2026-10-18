@@ -1357,8 +1357,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
     private fun normalize(s: String): String = s.lowercase().filter { it.isLetterOrDigit() }
 
     private fun setField(f: SchemaField, value: String): Boolean {
-        if (!trySetFromStringValue(f.gene, value)) return false
-        activateAncestors(f.gene)
+        if (!trySetFromStringValue(f.value, value)) return false
+        activateAncestors(f.value)
         return true
     }
 
