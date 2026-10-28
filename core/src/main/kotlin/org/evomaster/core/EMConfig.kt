@@ -3041,41 +3041,6 @@ class EMConfig {
             "When false, all experimental oracles are disabled.")
     var useExperimentalOracles = false
 
-    @Experimental
-    @Cfg("THESIS EXTENSION. Endpoint used to restore the SUT to a known state before each attempt at" +
-            " building a stateful-authorization (MR-A1) triple, given as \"<VERB> <URL>\", eg" +
-            " \"POST http://localhost:8080/reset\". This is the black-box analogue of the state reset" +
-            " that white-box EvoMaster performs through the SUT driver. When empty (the default), no" +
-            " reset is done, and the search phase may already have demoted or deleted the accounts the" +
-            " triple needs.")
-    var statefulAuthzResetEndpoint = ""
-
-    @Experimental
-    @Cfg("THESIS EXTENSION. Declare the permission-reducing transition explicitly, for APIs whose" +
-            " transition cannot be inferred from the schema: either because its name is outside the" +
-            " built-in vocabulary, or because the schema exposes no role enum to harvest a reduced" +
-            " value from. Format: \"<VERB> <PATH> name=value ...\", where a value may be the" +
-            " placeholder <victim> or <operator>, eg" +
-            " \"POST /api/set_user_permission user=<victim> role=1 permission=0\"." +
-            " When empty (the default), the transition is inferred from the schema exactly as before," +
-            " so this option cannot alter results measured without it. Note this declares only WHICH" +
-            " action reduces a permission and HOW to aim it at a victim: choosing the victim, finding" +
-            " the guarded action, replaying the pre-transition credential and judging the outcome all" +
-            " still run unchanged, so a run using this option does NOT measure black-box recall.")
-    var statefulAuthzTransition = ""
-
-    @Experimental
-    @Cfg("THESIS EXTENSION. Judge a stateful-authorization (MR-A1) triple with two credentials. After the" +
-            " triple has been executed, the same follow-up request is sent again in a separate test, in which" +
-            " the victim logs in after the transition and therefore uses a freshly issued credential. The fault" +
-            " is reported only when the source is 2xx, the transition is 2xx, the follow-up with the" +
-            " pre-transition credential is 2xx, and the follow-up with the fresh credential is denied, ie 403" +
-            " for every verb; a 2xx is not a denial, and any other status code is inconclusive and reports" +
-            " nothing. When true, neither the built-in transition" +
-            " vocabulary nor the re-login probe on the victim slice takes part in the judgment. When false" +
-            " (the default), the triple is judged exactly as before.")
-    var statefulAuthzTwoCredentialJudgment = false
-
     enum class VulnerableInputClassificationStrategy {
         /**
          * Uses the manual methods to select the vulnerable inputs.
