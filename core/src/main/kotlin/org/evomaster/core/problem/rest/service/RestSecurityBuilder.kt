@@ -23,7 +23,6 @@ import org.evomaster.core.problem.rest.builder.RestIndividualSelectorUtils
 import org.evomaster.core.problem.rest.data.*
 import org.evomaster.core.problem.rest.oracle.RestSecurityOracle.Companion.SQLI_PAYLOADS
 import org.evomaster.core.problem.rest.oracle.RestSecurityOracle.Companion.XSS_PAYLOADS
-import org.evomaster.core.problem.api.param.Param
 import org.evomaster.core.problem.rest.param.BodyParam
 import org.evomaster.core.problem.rest.param.PathParam
 import org.evomaster.core.problem.rest.param.QueryParam
@@ -84,8 +83,6 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
         private const val MAX_ENUM_VALUES = 12
 
-        private val TOKEN_PIECE = Regex("[^A-Za-z0-9]+")
-
         private val TOKEN_PART = Regex("[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 
         private fun loadModel(): Map<String, Map<String, Double>> {
@@ -129,17 +126,12 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
         fun tokens(text: String, minLength: Int = MIN_TOKEN_LENGTH): Set<String> {
             val out = mutableSetOf<String>()
-            for (piece in text.split(TOKEN_PIECE)) {
-                if (piece.isEmpty()) {
+            for (match in TOKEN_PART.findAll(text)) {
+                val token = match.value.lowercase()
+                if (token.length < minLength || isDigitsOnly(token)) {
                     continue
                 }
-                for (match in TOKEN_PART.findAll(piece)) {
-                    val token = match.value.lowercase()
-                    if (token.length < minLength || isDigitsOnly(token)) {
-                        continue
-                    }
-                    out.add(token)
-                }
+                out.add(token)
             }
             return out
         }
@@ -178,7 +170,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
                 enumValues = names
                 kind = when {
                     value is BooleanGene -> "bool"
-                    enum != null && enumValues.isNotEmpty() -> "enum"
+                    enumValues.isNotEmpty() -> "enum"
                     value is NumberGene<*> -> "num"
                     value is ArrayGene<*> || value is TaintedArrayGene -> "array"
                     value is ObjectGene || value is MapGene<*, *> || value is CycleObjectGene || value is LimitObjectGene -> "object"
@@ -337,7 +329,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
             return best ?: 0.0
         }
 
-        private val TRANSITION_VERBS =
+        val TRANSITION_VERBS =
             listOf(HttpVerb.PUT, HttpVerb.PATCH, HttpVerb.POST, HttpVerb.DELETE)
 
         private const val MAX_STATEFUL_TRIPLE_ATTEMPTS = 20
@@ -636,8 +628,6 @@ class RestSecurityBuilder : TimeBoxedPhase {
     private fun attemptAllowed(): Boolean =
         statefulTripleAttempts < MAX_STATEFUL_TRIPLE_ATTEMPTS && !candidateCapReached()
 
-    private class TransitionCandidate(val op: RestCallAction, val reducedValues: List<String>)
-
     private fun addForStatefulAccessControl() {
 
         if (!config.isEnabledFaultCategory(ExperimentalFaultCategory.SECURITY_STATEFUL_AUTHORIZATION)) {
@@ -648,17 +638,15 @@ class RestSecurityBuilder : TimeBoxedPhase {
             return
         }
 
-        individualsInSolution = archive.extractSolution().individuals
-
-        if (log.isDebugEnabled) {
-            logModelScores()
-        }
+        log.debug("Stateful-authorization model tables: op ${table("op").size - 1}" +
+                " role ${table("role").size - 1} victim ${table("victim").size - 1}" +
+                " low ${table("low").size} high ${table("high").size}")
         val ranked = rankPermissionReducingTransitions()
         if (ranked.isEmpty()) {
             log.debug("Skipping stateful-authorization: no permission-reducing transition endpoint found")
             return
         }
-        val viable = mutableListOf<TransitionCandidate>()
+        val viable = mutableListOf<RestCallAction>()
         for (candidate in ranked) {
             if (routeLooksMissing(candidate)) {
                 log.debug("Stateful-authorization transition candidate ${candidate.getName()}" +
@@ -670,10 +658,10 @@ class RestSecurityBuilder : TimeBoxedPhase {
             log.debug("Stateful-authorization transition candidate ${candidate.getName()}" +
                     " score ${transitionScore(candidate)}" +
                     " roleField ${roleField?.key}" +
-                    " victimField ${victimField(candidate, roleField)?.key}" +
+                    " victimField ${victimField(candidate)?.key}" +
                     " reducedRoleValues ${values.size}")
             if (values.isNotEmpty()) {
-                viable.add(TransitionCandidate(candidate, values))
+                viable.add(candidate)
             }
         }
         if (viable.isEmpty()) {
@@ -683,10 +671,10 @@ class RestSecurityBuilder : TimeBoxedPhase {
         }
 
         for (index in viable.indices) {
-            val transitionOp = viable[index].op
+            val transitionOp = viable[index]
             log.debug("Stateful-authorization transition chosen: ${transitionOp.getName()}" +
                     " (candidate ${index + 1} of ${viable.size})")
-            log.debug("Stateful-authorization reduced role values: ${viable[index].reducedValues}")
+            log.debug("Stateful-authorization reduced role values: ${harvestReducedRoleCandidates(transitionOp)}")
             transitionNotFoundSeen = false
             candidateAttempts = 0
             candidateProven = false
@@ -840,8 +828,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         victimSlice: RestIndividual,
         transitionDef: RestCallAction
     ): Boolean {
-        val victimAuth = victimSlice.seeMainExecutableActions().lastOrNull()?.auth ?: return false
-        if (victimAuth is NoAuth) return false
+        val victimAuth = victimSlice.seeMainExecutableActions().last().auth
 
         val pair = transitionDef.getName() to victimAuth.name
         if (refusedTransitionVictims.contains(pair)) {
@@ -861,19 +848,15 @@ class RestSecurityBuilder : TimeBoxedPhase {
         }
         log.debug("Stateful-authorization victim '${victimAuth.name}' operators $operatorNames")
 
-        val field = roleField(transitionDef)
-        var current: List<String> = emptyList()
-        var roleValues: List<String> = emptyList()
-        if (field != null) {
-            current = victimRoleValues(victimAuth, transitionDef, field)
-            roleValues = reducedRoleValues(field, current)
-        }
+        val field = roleField(transitionDef) ?: return false
+        val current = victimRoleValues(victimAuth, transitionDef, field)
+        val roleValues = reducedRoleValues(field, current)
         log.debug("Stateful-authorization victim '${victimAuth.name}' current roles $current, reduced role values $roleValues")
 
         victimRefused = false
 
         for (operator in operators) {
-            val outcome = tryReducedRoles(victimSlice, transitionDef, roleValues, operator, victimAuth, pair)
+            val outcome = tryReducedRoles(victimSlice, transitionDef, roleValues, operator, victimAuth)
             if (outcome == RoleAttempt.TRIPLE_BUILT) {
                 return true
             }
@@ -885,7 +868,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         val src = lastSourceCode
         val operatorsRefused = lastTransitionCode == 401 || lastTransitionCode == 403
         if (operatorsRefused && src != null && StatusGroup.G_2xx.isInGroup(src)) {
-            val outcome = restoreOperatorsAndRetry(victimSlice, transitionDef, roleValues, operators, victimAuth, pair)
+            val outcome = restoreOperatorsAndRetry(victimSlice, transitionDef, roleValues, operators, victimAuth)
             if (outcome == RoleAttempt.TRIPLE_BUILT) {
                 return true
             }
@@ -909,8 +892,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         transitionDef: RestCallAction,
         roleValues: List<String>,
         operator: HttpWsAuthenticationInfo,
-        victimAuth: HttpWsAuthenticationInfo,
-        pair: Pair<String, String>
+        victimAuth: HttpWsAuthenticationInfo
     ): RoleAttempt {
         for (reducedRole in roleValues) {
             if (hasPhaseTimedOut()) return RoleAttempt.STOP_VICTIM
@@ -930,7 +912,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
             if (transitionRefusedAfterSource()) {
                 victimRefused = true
             }
-            if (privilegeReducedInPhase.contains(victimAuth.name) || refusedTransitionVictims.contains(pair)) {
+            if (privilegeReducedInPhase.contains(victimAuth.name)
+                || refusedTransitionVictims.contains(transitionDef.getName() to victimAuth.name)) {
                 return RoleAttempt.STOP_VICTIM
             }
             if (!transitionRejectedRoleValue()) {
@@ -945,8 +928,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         transitionDef: RestCallAction,
         roleValues: List<String>,
         operators: List<HttpWsAuthenticationInfo>,
-        victimAuth: HttpWsAuthenticationInfo,
-        pair: Pair<String, String>
+        victimAuth: HttpWsAuthenticationInfo
     ): RoleAttempt {
         val exclude = roleValues.firstOrNull() ?: ""
         val plans = mutableMapOf<String, List<List<Pair<String, String>>>>()
@@ -966,7 +948,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         }
 
         for (operator in operators) {
-            for (plan in plans[operator.name] ?: emptyList()) {
+            for (plan in plans.getValue(operator.name)) {
                 if (hasPhaseTimedOut()) return RoleAttempt.STOP_VICTIM
                 if (!attemptAllowed()) return RoleAttempt.STOP_VICTIM
                 if (privilegeRestoreAttempts >= MAX_PRIVILEGE_RESTORES) {
@@ -981,7 +963,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
                     continue
                 }
 
-                val outcome = tryReducedRoles(victimSlice, transitionDef, roleValues, operator, victimAuth, pair)
+                val outcome = tryReducedRoles(victimSlice, transitionDef, roleValues, operator, victimAuth)
                 if (outcome == RoleAttempt.TRIPLE_BUILT || outcome == RoleAttempt.STOP_VICTIM) {
                     return outcome
                 }
@@ -1023,9 +1005,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
         operator: HttpWsAuthenticationInfo
     ): Boolean {
         val base = victimSlice.copy() as RestIndividual
-        val source = base.seeMainExecutableActions().lastOrNull() ?: return false
+        val source = base.seeMainExecutableActions().last()
         val victimAuth = source.auth
-        if (victimAuth is NoAuth) return false
 
         val transition = transitionDef.copy() as RestCallAction
         transition.resetLocalIdRecursively()
@@ -1042,15 +1023,13 @@ class RestSecurityBuilder : TimeBoxedPhase {
             log.debug("Stateful-authorization: could not set reduced role '$reducedRole' on ${transition.getName()}")
             return false
         }
-        keepOnlyTargetFields(transition, (targeted + reduced).toSet())
+        keepOnlyTargetFields(transition, targeted + reduced)
         setUserNameFieldsToVictim(transition, victimAuth, targeted)
         base.addMainActionInEmptyEnterpriseGroup(action = transition)
 
         val followUp = source.copy() as RestCallAction
         followUp.resetLocalIdRecursively()
         followUp.forceNewTaints()
-        followUp.auth = victimAuth
-        followUp.usePreviousLocationId = source.usePreviousLocationId
         followUp.bindBasedOn(source.path, source.parameters.filterIsInstance<PathParam>(), null)
         base.addMainActionInEmptyEnterpriseGroup(action = followUp)
 
@@ -1176,7 +1155,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
             ?: return reLoginProbeInconclusive("the replayed slice sent without credentials could not be evaluated")
         val anonymousCode = lastRecordedStatus(control, cei)
         LoggingUtil.getInfoLogger().info(
-            "Stateful-authorization anonymous control: ${control.seeMainExecutableActions().lastOrNull()?.getName()}" +
+            "Stateful-authorization anonymous control: ${control.seeMainExecutableActions().last().getName()}" +
                 "=${anonymousCode ?: "-"}"
         )
         if (anonymousCode == null) {
@@ -1196,17 +1175,11 @@ class RestSecurityBuilder : TimeBoxedPhase {
     private fun rankPermissionReducingTransitions(): List<RestCallAction> {
         val transitions = mutableListOf<RestCallAction>()
         for (a in actionDefinitions) {
-            if (a.verb in TRANSITION_VERBS && transitionScore(a) > 0.0) {
+            if (looksLikePermissionReducingTransition(a)) {
                 transitions.add(a)
             }
         }
         return transitions.sortedByDescending { transitionScore(it) }
-    }
-
-    private fun logModelScores() {
-        log.debug("Stateful-authorization model tables: op ${table("op").size - 1}" +
-                " role ${table("role").size - 1} victim ${table("victim").size - 1}" +
-                " low ${table("low").size} high ${table("high").size}")
     }
 
     private fun roleField(a: RestCallAction): SchemaField? {
@@ -1217,7 +1190,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
                 continue
             }
             val score = fieldScore("role", f)
-            if (score > 0.0 && (best == null || score > bestScore)) {
+            if (score > bestScore) {
                 best = f
                 bestScore = score
             }
@@ -1225,7 +1198,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
         return best
     }
 
-    private fun victimField(a: RestCallAction, role: SchemaField?): SchemaField? {
+    private fun victimField(a: RestCallAction): SchemaField? {
+        val role = roleField(a)
         var best: SchemaField? = null
         var bestScore = 0.0
         for (f in schemaFields(a)) {
@@ -1256,23 +1230,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
     private fun reducedRoleValues(field: SchemaField, current: List<String>): List<String> {
         val raw = when (field.kind) {
-            "enum" -> {
-                val low = mutableListOf<String>()
-                val rest = mutableListOf<String>()
-                for (v in field.enumValues) {
-                    if (lowMinusHigh(v) > 0.0) {
-                        low.add(v)
-                    } else {
-                        rest.add(v)
-                    }
-                }
-                low.sortedByDescending { lowMinusHigh(it) } + rest.sortedByDescending { lowMinusHigh(it) }
-            }
-            "bool" -> when (current.firstOrNull()?.lowercase()) {
-                "true" -> listOf("false")
-                "false" -> listOf("true")
-                else -> listOf("false")
-            }
+            "enum" -> field.enumValues.sortedByDescending { lowMinusHigh(it) }
+            "bool" -> if (current.firstOrNull()?.lowercase() == "false") listOf("true") else listOf("false")
             "array" -> listOf(emptyRoleList)
             "num" -> numericRoleCandidates
             "str" -> tableValues("lowstr")
@@ -1316,15 +1275,15 @@ class RestSecurityBuilder : TimeBoxedPhase {
     }
 
     private fun restoreValues(field: SchemaField, snapshot: String?, exclude: String): List<String> {
-        if (snapshot != null && valueScore("low", snapshot) <= valueScore("high", snapshot)) {
+        if (snapshot != null && lowMinusHigh(snapshot) <= 0.0) {
             return if (snapshot == exclude) emptyList() else listOf(snapshot)
         }
         val raw = when (field.kind) {
             "enum" -> {
-                val ranked = field.enumValues.sortedByDescending { valueScore("high", it) - valueScore("low", it) }
+                val ranked = field.enumValues.sortedBy { lowMinusHigh(it) }
                 val high = mutableListOf<String>()
                 for (v in ranked) {
-                    if (valueScore("high", v) > valueScore("low", v)) {
+                    if (lowMinusHigh(v) < 0.0) {
                         high.add(v)
                     }
                 }
@@ -1350,7 +1309,6 @@ class RestSecurityBuilder : TimeBoxedPhase {
         exclude: String
     ): List<List<Pair<String, String>>> {
         val fields = restoreFields(transition)
-        if (fields.isEmpty()) return emptyList()
         val snapshot = victimSnapshot(account, transition, fields)
         val perField = mutableListOf<Pair<String, List<String>>>()
         for (f in fields) {
@@ -1359,7 +1317,6 @@ class RestSecurityBuilder : TimeBoxedPhase {
                 perField.add(f.key to values)
             }
         }
-        if (perField.isEmpty()) return emptyList()
         var longest = 0
         for (entry in perField) {
             if (entry.second.size > longest) {
@@ -1387,8 +1344,6 @@ class RestSecurityBuilder : TimeBoxedPhase {
         victimSlice: RestIndividual
     ): Boolean {
 
-        if (privilegeRestoreAttempts >= MAX_PRIVILEGE_RESTORES) return false
-
         val action = transitionDef.copy() as RestCallAction
         action.resetLocalIdRecursively()
         action.forceNewTaints()
@@ -1412,7 +1367,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         if (setKeys.isEmpty()) {
             return restoreSkipped(action, target.name, "no role field accepted the restore values $planValues")
         }
-        keepOnlyTargetFields(action, (targeted + setKeys).toSet())
+        keepOnlyTargetFields(action, targeted + setKeys)
         setUserNameFieldsToVictim(action, target, targeted)
 
         val base = victimSlice.copy() as RestIndividual
@@ -1485,7 +1440,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         val keys = mutableSetOf<String>()
         try {
             val node = ObjectMapper().readTree(payload)
-            if (node != null && node.isObject) {
+            if (node.isObject) {
                 for (entry in node.fields()) {
                     if (entry.value.isTextual && entry.value.asText() == name) {
                         keys.add(entry.key)
@@ -1514,7 +1469,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         return keys
     }
 
-    private data class ScoredObject(val verb: HttpVerb, val path: String, val node: JsonNode, val matches: Int)
+    private class ScoredObject(val verb: HttpVerb, val path: String, val node: JsonNode, val matches: Int)
 
     private val victimObjectCache = mutableMapOf<String, List<ScoredObject>>()
 
@@ -1539,16 +1494,14 @@ class RestSecurityBuilder : TimeBoxedPhase {
         transition: RestCallAction
     ): List<ScoredObject> {
         val idKeys = identityKeys(victimAuth, victimLeaf)
-        if (idKeys.isEmpty()) return emptyList()
         val mapper = ObjectMapper()
         val prefix = transition.path.toString().substringBefore("{")
         val objects = mutableListOf<ScoredObject>()
         for (ea in RestIndividualSelectorUtils.findEvaluatedActions(
             individualsInSolution, statusGroup = StatusGroup.G_2xx
         )) {
-            val action = ea.action
-            val result = ea.result
-            if (action !is RestCallAction || result !is RestCallResult) continue
+            val action = ea.action as RestCallAction
+            val result = ea.result as RestCallResult
             val body = result.getBody() ?: continue
             if (!body.contains(victimAuth.name)) continue
             val node = try { mapper.readTree(body) } catch (e: Exception) { continue }
@@ -1562,8 +1515,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
     }
 
     private fun compareVictimObjects(a: ScoredObject, b: ScoredObject, prefix: String): Int {
-        val aUnderPrefix = prefix.isNotEmpty() && a.path.startsWith(prefix)
-        val bUnderPrefix = prefix.isNotEmpty() && b.path.startsWith(prefix)
+        val aUnderPrefix = a.path.startsWith(prefix)
+        val bUnderPrefix = b.path.startsWith(prefix)
         if (aUnderPrefix != bUnderPrefix) {
             return if (aUnderPrefix) -1 else 1
         }
@@ -1595,10 +1548,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
         if (node.isObject && matchingKeys(node, victimName, idKeys) > 0) {
             into.add(node)
         }
-        if (node.isContainerNode) {
-            for (child in node) {
-                collectVictimObjects(child, victimName, idKeys, into)
-            }
+        for (child in node) {
+            collectVictimObjects(child, victimName, idKeys, into)
         }
     }
 
@@ -1639,7 +1590,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         transition: RestCallAction,
         fields: List<SchemaField>
     ): Map<String, String> {
-        val vfLeaf = victimField(transition, roleField(transition))?.leaf ?: ""
+        val vfLeaf = victimField(transition)?.leaf ?: ""
         val objects = getObjects(victimObjects(victimAuth, vfLeaf, transition))
         val snapshot = mutableMapOf<String, String>()
         for (f in fields) {
@@ -1656,7 +1607,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         transition: RestCallAction,
         role: SchemaField
     ): List<String> {
-        val vfLeaf = victimField(transition, role)?.leaf ?: ""
+        val vfLeaf = victimField(transition)?.leaf ?: ""
         val leaf = normalize(role.leaf)
         val out = mutableListOf<String>()
         for (o in getObjects(victimObjects(victimAuth, vfLeaf, transition))) {
@@ -1673,13 +1624,13 @@ class RestSecurityBuilder : TimeBoxedPhase {
         val out = mutableListOf<String>()
         for (entry in node.fields()) {
             val nk = normalize(entry.key)
-            if (nk != leaf && !leaf.startsWith(nk)) {
+            if (!leaf.startsWith(nk)) {
                 continue
             }
             val v = entry.value
             if (v.isValueNode && !v.isNull) {
                 out.add(v.asText())
-            } else if (v.isObject || v.isArray) {
+            } else {
                 for (c in v) {
                     if (c.isValueNode && !c.isNull) out.add(c.asText())
                 }
@@ -1689,7 +1640,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
     }
 
     private fun setUserTargetToVictim(action: RestCallAction, victimAuth: HttpWsAuthenticationInfo): List<String>? {
-        val vf = victimField(action, roleField(action)) ?: return null
+        val vf = victimField(action) ?: return null
         val objects = victimObjects(victimAuth, vf.leaf, action)
         if (!placeVictimValue(vf, victimAuth.name, objects)) {
             return null
@@ -1703,7 +1654,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
                     continue
                 }
                 val score = fieldScore("victim", f)
-                if (score > 0.0 && (pathField == null || score > pathScore)) {
+                if (score > pathScore) {
                     pathField = f
                     pathScore = score
                 }
@@ -1718,7 +1669,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
     private fun placeVictimValue(f: SchemaField, victimName: String, objects: List<ScoredObject>): Boolean {
         val keyed = objectValue(objects, normalize(f.leaf))
-        val id = victimId(objects, normalize(f.leaf))
+        val id = objectValue(objects, "id")
         val candidates = when {
             keyed != null -> listOf(keyed)
             f.kind == "num" -> listOfNotNull(id)
@@ -1739,16 +1690,13 @@ class RestSecurityBuilder : TimeBoxedPhase {
         return if (ok) listOf(f.key) else null
     }
 
-    private fun keepOnlyTargetFields(action: RestCallAction, keep: Set<String>) {
+    private fun keepOnlyTargetFields(action: RestCallAction, keep: List<String>) {
         val removed = mutableListOf<String>()
         for (f in schemaFields(action)) {
             if (f.key in keep) continue
             val gene = f.gene
-            if (f.loc == "body" && gene is OptionalGene && gene.isActive && "." !in f.name) {
-                gene.isActive = false
-                removed.add(f.name)
-            }
-            if (f.loc == "query" && gene is OptionalGene && gene.isActive) {
+            val topLevelBody = f.loc == "body" && "." !in f.name
+            if ((topLevelBody || f.loc == "query") && gene is OptionalGene && gene.isActive) {
                 gene.isActive = false
                 removed.add(f.name)
             }
@@ -1762,7 +1710,6 @@ class RestSecurityBuilder : TimeBoxedPhase {
         targeted: List<String>
     ) {
         val idKeys = identityKeys(victimAuth, "")
-        if (idKeys.isEmpty()) return
         val set = mutableListOf<String>()
         for (f in schemaFields(action)) {
             if (f.loc != "body" || f.kind != "str" || f.key in targeted || normalize(f.leaf) !in idKeys) {
@@ -1789,10 +1736,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         var calledParent = false
         var all404 = true
         for (ea in RestIndividualSelectorUtils.findEvaluatedActions(individualsInSolution, authenticated = true)) {
-            val action = ea.action
-            if (action !is RestCallAction) {
-                continue
-            }
+            val action = ea.action as RestCallAction
             val p = action.path.toString()
             if (p != path && p != parent) {
                 continue
@@ -1800,8 +1744,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
             if (p == parent) {
                 calledParent = true
             }
-            val result = ea.result
-            val code = if (result is RestCallResult) result.getStatusCode() else null
+            val code = (ea.result as RestCallResult).getStatusCode()
             if (code != 404) {
                 all404 = false
             }

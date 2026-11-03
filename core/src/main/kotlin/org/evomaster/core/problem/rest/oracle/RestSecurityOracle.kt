@@ -555,20 +555,17 @@ class RestSecurityOracle {
         fv: FitnessValue
     ) {
 
-        if (!config.isEnabledFaultCategory(ExperimentalFaultCategory.SECURITY_STATEFUL_AUTHORIZATION)) {
-            return
-        }
         if (!restSecurityBuilder.statefulTripleUnderEvaluation) {
             return
         }
 
         val actions = individual.seeMainExecutableActions()
 
-        fun statusOf(a: RestCallAction): Int? =
-            (actionResults.find { it.sourceLocalId == a.getLocalId() } as RestCallResult?)?.getStatusCode()
+        fun resultOf(a: RestCallAction): RestCallResult? =
+            actionResults.find { it.sourceLocalId == a.getLocalId() } as RestCallResult?
 
         fun isAllowed(a: RestCallAction): Boolean {
-            val code = statusOf(a) ?: return false
+            val code = resultOf(a)?.getStatusCode() ?: return false
             return StatusGroup.G_2xx.isInGroup(code)
         }
 
@@ -576,7 +573,7 @@ class RestSecurityOracle {
             val source = actions[srcIndex]
             if (source.auth is NoAuth
                 || !isAllowed(source)
-                || source.verb !in listOf(HttpVerb.PUT, HttpVerb.PATCH, HttpVerb.POST, HttpVerb.DELETE)
+                || source.verb !in RestSecurityBuilder.TRANSITION_VERBS
                 || RestSecurityBuilder.looksLikePermissionReducingTransition(source)) {
                 continue
             }
@@ -605,18 +602,13 @@ class RestSecurityOracle {
                     continue
                 }
 
-                val result = actionResults
-                    .filterIsInstance<RestCallResult>()
-                    .find { it.sourceLocalId == followUp.getLocalId() }
-                    ?: continue
-
                 val scenarioId = idMapper.handleLocalTarget(
                     idMapper.getFaultDescriptiveId(
                         ExperimentalFaultCategory.SECURITY_STATEFUL_AUTHORIZATION, followUp.getName()
                     )
                 )
                 fv.updateTarget(scenarioId, 1.0, followUpIndex)
-                result.addFault(
+                resultOf(followUp)!!.addFault(
                     DetectedFault(ExperimentalFaultCategory.SECURITY_STATEFUL_AUTHORIZATION, followUp.getName(), null)
                 )
                 return
