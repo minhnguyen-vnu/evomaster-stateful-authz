@@ -246,14 +246,10 @@ class RestSecurityBuilder : TimeBoxedPhase {
             if (depth >= MAX_FIELD_DEPTH) {
                 return
             }
-            if (v is ArrayGene<*>) {
-                for (child in objectFields(v.template)) {
-                    walkBody("$name[].${child.name}", child, depth + 1, out)
-                }
-            } else {
-                for (child in objectFields(g)) {
-                    walkBody("$name.${child.name}", child, depth + 1, out)
-                }
+            val container = if (v is ArrayGene<*>) v.template else g
+            val prefix = if (v is ArrayGene<*>) "$name[]" else name
+            for (child in objectFields(container)) {
+                walkBody("$prefix.${child.name}", child, depth + 1, out)
             }
         }
 
@@ -310,10 +306,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
         private val opEvidenceCache = java.util.concurrent.ConcurrentHashMap<String, Double>()
 
-        fun transitionEvidence(a: RestCallAction): Double =
-            opEvidenceCache.getOrPut(a.getName()) { evidence("op", opFeatures(a)) }
-
-        fun transitionScore(a: RestCallAction): Double = prior("op") + transitionEvidence(a)
+        fun transitionScore(a: RestCallAction): Double =
+            prior("op") + opEvidenceCache.getOrPut(a.getName()) { evidence("op", opFeatures(a)) }
 
         fun valueScore(name: String, value: String): Double {
             val v = value.lowercase()
@@ -857,11 +851,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
         for (operator in operators) {
             val outcome = tryReducedRoles(victimSlice, transitionDef, roleValues, operator, victimAuth)
-            if (outcome == RoleAttempt.TRIPLE_BUILT) {
-                return true
-            }
-            if (outcome == RoleAttempt.STOP_VICTIM) {
-                return false
+            if (outcome != RoleAttempt.NEXT) {
+                return outcome == RoleAttempt.TRIPLE_BUILT
             }
         }
 
@@ -869,11 +860,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
         val operatorsRefused = lastTransitionCode == 401 || lastTransitionCode == 403
         if (operatorsRefused && src != null && StatusGroup.G_2xx.isInGroup(src)) {
             val outcome = restoreOperatorsAndRetry(victimSlice, transitionDef, roleValues, operators, victimAuth)
-            if (outcome == RoleAttempt.TRIPLE_BUILT) {
-                return true
-            }
-            if (outcome == RoleAttempt.STOP_VICTIM) {
-                return false
+            if (outcome != RoleAttempt.NEXT) {
+                return outcome == RoleAttempt.TRIPLE_BUILT
             }
         }
 
@@ -895,8 +883,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         victimAuth: HttpWsAuthenticationInfo
     ): RoleAttempt {
         for (reducedRole in roleValues) {
-            if (hasPhaseTimedOut()) return RoleAttempt.STOP_VICTIM
-            if (!attemptAllowed()) return RoleAttempt.STOP_VICTIM
+            if (hasPhaseTimedOut() || !attemptAllowed()) return RoleAttempt.STOP_VICTIM
 
             val before = statefulTripleAttempts
             if (executeStatefulAuthzTriple(victimSlice, transitionDef, reducedRole, operator)) {
@@ -949,8 +936,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
 
         for (operator in operators) {
             for (plan in plans.getValue(operator.name)) {
-                if (hasPhaseTimedOut()) return RoleAttempt.STOP_VICTIM
-                if (!attemptAllowed()) return RoleAttempt.STOP_VICTIM
+                if (hasPhaseTimedOut() || !attemptAllowed()) return RoleAttempt.STOP_VICTIM
                 if (privilegeRestoreAttempts >= MAX_PRIVILEGE_RESTORES) {
                     LoggingUtil.getInfoLogger().info(
                         "Stateful-authorization restore budget of $MAX_PRIVILEGE_RESTORES spent on" +
@@ -1182,14 +1168,14 @@ class RestSecurityBuilder : TimeBoxedPhase {
         return transitions.sortedByDescending { transitionScore(it) }
     }
 
-    private fun roleField(a: RestCallAction): SchemaField? {
+    private fun bestField(a: RestCallAction, model: String, onPath: Boolean): SchemaField? {
         var best: SchemaField? = null
         var bestScore = 0.0
         for (f in schemaFields(a)) {
-            if (f.loc == "path") {
+            if ((f.loc == "path") != onPath) {
                 continue
             }
-            val score = fieldScore("role", f)
+            val score = fieldScore(model, f)
             if (score > bestScore) {
                 best = f
                 bestScore = score
@@ -1197,6 +1183,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
         }
         return best
     }
+
+    private fun roleField(a: RestCallAction): SchemaField? = bestField(a, "role", false)
 
     private fun victimField(a: RestCallAction): SchemaField? {
         val role = roleField(a)
@@ -1405,7 +1393,8 @@ class RestSecurityBuilder : TimeBoxedPhase {
     private fun normalize(s: String): String = s.lowercase().filter { it.isLetterOrDigit() }
 
     private fun setField(f: SchemaField, value: String): Boolean {
-        if (!trySetFromStringValue(f.value, value)) return false
+        val accepted = try { f.value.setFromStringValue(value) } catch (e: Exception) { false }
+        if (!accepted) return false
         activateAncestors(f.value)
         return true
     }
@@ -1477,16 +1466,10 @@ class RestSecurityBuilder : TimeBoxedPhase {
         victimAuth: HttpWsAuthenticationInfo,
         victimLeaf: String,
         transition: RestCallAction
-    ): List<ScoredObject> {
-        val cacheKey = "${victimAuth.name}|$victimLeaf|${transition.path}"
-        val cached = victimObjectCache[cacheKey]
-        if (cached != null) {
-            return cached
+    ): List<ScoredObject> =
+        victimObjectCache.getOrPut("${victimAuth.name}|$victimLeaf|${transition.path}") {
+            findVictimObjects(victimAuth, victimLeaf, transition)
         }
-        val objects = findVictimObjects(victimAuth, victimLeaf, transition)
-        victimObjectCache[cacheKey] = objects
-        return objects
-    }
 
     private fun findVictimObjects(
         victimAuth: HttpWsAuthenticationInfo,
@@ -1575,9 +1558,10 @@ class RestSecurityBuilder : TimeBoxedPhase {
         return "id" in t || "ids" in t
     }
 
-    private fun getObjects(objects: List<ScoredObject>): List<ScoredObject> {
+    private fun victimGetObjects(victimAuth: HttpWsAuthenticationInfo, transition: RestCallAction): List<ScoredObject> {
+        val vfLeaf = victimField(transition)?.leaf ?: ""
         val out = mutableListOf<ScoredObject>()
-        for (o in objects) {
+        for (o in victimObjects(victimAuth, vfLeaf, transition)) {
             if (o.verb == HttpVerb.GET) {
                 out.add(o)
             }
@@ -1590,8 +1574,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         transition: RestCallAction,
         fields: List<SchemaField>
     ): Map<String, String> {
-        val vfLeaf = victimField(transition)?.leaf ?: ""
-        val objects = getObjects(victimObjects(victimAuth, vfLeaf, transition))
+        val objects = victimGetObjects(victimAuth, transition)
         val snapshot = mutableMapOf<String, String>()
         for (f in fields) {
             val v = objectValue(objects, normalize(f.leaf))
@@ -1607,10 +1590,9 @@ class RestSecurityBuilder : TimeBoxedPhase {
         transition: RestCallAction,
         role: SchemaField
     ): List<String> {
-        val vfLeaf = victimField(transition)?.leaf ?: ""
         val leaf = normalize(role.leaf)
         val out = mutableListOf<String>()
-        for (o in getObjects(victimObjects(victimAuth, vfLeaf, transition))) {
+        for (o in victimGetObjects(victimAuth, transition)) {
             for (s in scalarsForRoleKey(o.node, leaf)) {
                 if (s.isNotBlank() && s !in out) {
                     out.add(s)
@@ -1647,18 +1629,7 @@ class RestSecurityBuilder : TimeBoxedPhase {
         }
         val set = mutableListOf(vf.key)
         if (vf.loc != "path") {
-            var pathField: SchemaField? = null
-            var pathScore = 0.0
-            for (f in schemaFields(action)) {
-                if (f.loc != "path") {
-                    continue
-                }
-                val score = fieldScore("victim", f)
-                if (score > pathScore) {
-                    pathField = f
-                    pathScore = score
-                }
-            }
+            val pathField = bestField(action, "victim", true)
             if (pathField != null) {
                 val id = victimId(objects, normalize(pathField.leaf))
                 if (id != null && setField(pathField, id)) set.add(pathField.key)
@@ -1751,13 +1722,6 @@ class RestSecurityBuilder : TimeBoxedPhase {
         }
         return calledParent && all404
     }
-
-    private fun trySetFromStringValue(g: Gene, value: String): Boolean =
-        try {
-            g.setFromStringValue(value)
-        } catch (e: Exception) {
-            false
-        }
 
     private fun addForInjections() {
 

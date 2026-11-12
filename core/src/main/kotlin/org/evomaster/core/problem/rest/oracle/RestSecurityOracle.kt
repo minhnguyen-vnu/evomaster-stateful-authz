@@ -581,10 +581,8 @@ class RestSecurityOracle {
             for (followUpIndex in (srcIndex + 1) until actions.size) {
                 val followUp = actions[followUpIndex]
 
-                if (followUp.getName() != source.getName() || followUp.auth.isDifferentFrom(source.auth)) {
-                    continue
-                }
-                if (!isAllowed(followUp)) {
+                if (followUp.getName() != source.getName() || followUp.auth.isDifferentFrom(source.auth)
+                    || !isAllowed(followUp)) {
                     continue
                 }
 
